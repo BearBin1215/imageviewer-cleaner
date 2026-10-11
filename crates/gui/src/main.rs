@@ -4,6 +4,10 @@
 //! 通过 `Reporter` 把进度送回主线程，并触发 `request_repaint()` 唤醒界面。
 //! 主线程每帧只做非阻塞的 `try_recv()`，因此清理期间窗口不会「未响应」。
 
+// 发布构建声明为 GUI 子系统，避免双击启动时额外弹出一个控制台窗口；
+// 调试构建保留控制台子系统，便于在终端里查看输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -25,6 +29,7 @@ const FONT: &[u8] = include_bytes!("../assets/font_subset.ttf");
 fn main() -> eframe::Result {
     // --scan：无界面自检，结果写入 scan-output.txt。
     // 便于在没有交互桌面的环境里验证探测逻辑。
+    // 发布构建没有控制台，终端里不会打印提示，直接看文件即可。
     if std::env::args().any(|a| a == "--scan") {
         run_scan();
         return Ok(());

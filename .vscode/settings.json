@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "files.eol": "\n",
+  "files.trimTrailingWhitespace": true
+}

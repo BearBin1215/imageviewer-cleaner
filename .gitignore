@@ -1,0 +1,22 @@
+# Rust 构建产物
+target/
+
+# 应用自检产物
+scan-output.txt
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.idea/
+*.swp
+
+# 编辑器配置：保留共享的调试配置，忽略个人设置
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+
+# 清理工具的运行时产物（隔离区/日志）
+backup/
+logs/
+imageviewer-cleaner/

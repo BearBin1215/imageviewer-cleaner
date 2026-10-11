@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: 构建
+        run: cargo build --release -p imageviewer-cleaner-gui --features embed-font
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          $exe = "target/release/imageviewer-cleaner.exe"
+          $mb = (Get-Item $exe).Length / 1MB
+          Write-Host ("产物体积: {0:N2} MB" -f $mb)
+          if ($mb -gt 8) { throw "体积超过 8 MB 门禁" }
+
+      - name: 计算校验和
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash "target/release/imageviewer-cleaner.exe" -Algorithm SHA256).Hash
+          "$h  imageviewer-cleaner.exe" | Out-File -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "target/release/imageviewer-cleaner.exe" `
+            "SHA256SUMS.txt" `
+            --title $env:GITHUB_REF_NAME `
+            --generate-notes

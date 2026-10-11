@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "构建（debug，免提权）",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build",
+        "-p",
+        "imageviewer-cleaner-gui",
+        "--features",
+        "dev-no-elevation"
+      ],
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "构建（release，需提权）",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--release", "-p", "imageviewer-cleaner-gui"],
+      "problemMatcher": ["$rustc"],
+      "group": "build"
+    },
+    {
+      "label": "测试",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["test", "--workspace"],
+      "problemMatcher": ["$rustc"],
+      "group": "test"
+    }
+  ]
+}

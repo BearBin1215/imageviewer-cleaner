@@ -1,0 +1,21 @@
+{
+  "_comment": "候选安装路径（兜底用）。首选是进程镜像路径反查，次选是注册表 InstallDir —— 见 M0b §4.2 实测：该注册表键在部分机器上不存在。",
+  "marker": "BaiduNetdisk.exe",
+  "candidates": [
+    "%ProgramFiles%\\Baidu\\BaiduNetdisk",
+    "%ProgramFiles(x86)%\\Baidu\\BaiduNetdisk",
+    "%ProgramFiles%\\BaiduNetdisk",
+    "%ProgramFiles(x86)%\\BaiduNetdisk",
+    "%APPDATA%\\baidu\\BaiduNetdisk",
+    "%LOCALAPPDATA%\\Baidu\\BaiduNetdisk",
+    "C:\\BaiduNetdisk",
+    "D:\\BaiduNetdisk",
+    "D:\\Program Files\\BaiduNetdisk",
+    "E:\\BaiduNetdisk",
+    "E:\\Program Files\\BaiduNetdisk"
+  ],
+  "install_dir_registry_value": {
+    "sub": "Software\\Baidu\\BaiduNetdisk",
+    "value": "InstallDir"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试 GUI",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/imageviewer-cleaner.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "preLaunchTask": "构建（debug，免提权）"
+    },
+    {
+      "name": "自检模式（--scan）",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/imageviewer-cleaner.exe",
+      "args": ["--scan"],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "preLaunchTask": "构建（debug，免提权）"
+    }
+  ]
+}

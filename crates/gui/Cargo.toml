@@ -1,0 +1,30 @@
+[package]
+name = "imageviewer-cleaner-gui"
+description = "百度网盘捆绑组件清理工具 · egui 界面"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "imageviewer-cleaner"
+path = "src/main.rs"
+# 发布构建的清单要求管理员权限，测试目标无法在无交互环境下启动。
+# 本 bin 没有单元测试，核心逻辑都在 core crate 里，因此不构建测试目标。
+test = false
+
+[dependencies]
+imageviewer-cleaner-core = { path = "../core" }
+# 关闭 wgpu 可减少约 8.5 MB 体积；必须保留 default_fonts（子集外的符号靠它回退）
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+
+[features]
+# 默认嵌入中文字体子集：不嵌入的话界面中文会显示成方块
+default = ["embed-font"]
+# 开发期免提权，便于调试；发布构建不启用
+dev-no-elevation = []
+# 嵌入 assets/font_subset.ttf（由 tools/subset_font.py 生成）
+embed-font = []
+
+[build-dependencies]
+embed-resource = "3.0.12"

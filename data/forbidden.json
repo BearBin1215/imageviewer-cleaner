@@ -1,0 +1,22 @@
+{
+  "_comment": "禁区：任何删除操作前必须通过 guard::assert_not_forbidden。这些是主客户端自身的运行依赖，误删会导致网盘无法启动。",
+  "relative_paths": [
+    "BaiduNetdisk.exe",
+    "BaiduNetdiskRender.exe",
+    "BugReport.exe",
+    "HelpUtility.exe",
+    "module\\BrowserEngine\\BaiduNetdiskUnite.exe",
+    "module\\BrowserEngine\\baidunetdiskhost.exe",
+    "module\\BrowserEngine\\crashpad_handler.exe",
+    "module\\BrowserEngine\\resources\\app.asar",
+    "module\\BrowserEngine\\resources\\core.asar",
+    "module\\BrowserEngine\\resources",
+    "module\\AiEngine",
+    "module\\SpeechSDK",
+    "module\\KernelCom",
+    "module\\BaiduNetdiskModuleList.db",
+    "uninst.exe"
+  ],
+  "_comment_share": "module\\BrowserEngine\\resources 整体禁区。当前没有任何组件会清理 resources 下的文件，因此例外列表为空——resources 子树受全面保护。若将来需清理其中某个文件，再在此添加精确路径（guard 采用「精确匹配 + 前缀禁区 + 例外白名单」三层判定，见 guard.rs）。",
+  "shared_dir_exceptions": []
+}

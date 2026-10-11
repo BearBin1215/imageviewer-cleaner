@@ -1,0 +1,21 @@
+{
+  "_comment": "来源：CSDN 2026-09 版清理脚本的扩展名清单，与 M0b 本机实测的 OpenWithList / UserChoice 行为一致。",
+  "video": [
+    ".264", ".265", ".3g2", ".3gp", ".avc", ".avi", ".avs", ".avs2", ".avs3", ".bik",
+    ".bk2", ".dav", ".dif", ".dv", ".evc", ".f4v", ".flv", ".h261", ".h263", ".h264",
+    ".h265", ".h26l", ".hevc", ".ifv", ".ism", ".ismv", ".j2k", ".kux", ".m2t", ".m2ts",
+    ".m2v", ".mj2", ".mjpg", ".mk3d", ".mkv", ".moflex", ".mov", ".mp4", ".mpeg", ".mpg",
+    ".mts", ".mxf", ".mxg", ".nsv", ".obu", ".pdv", ".pmp", ".psp", ".r3d", ".rcv",
+    ".rm", ".rmvb", ".roq", ".smk", ".str", ".swf", ".tmv", ".ts", ".ty", ".usm",
+    ".v", ".v210", ".vc1", ".viv", ".vob", ".vpk", ".vvc", ".webm", ".wmv", ".wtv",
+    ".xmv", ".y4m", ".yop", ".yuv", ".yuv10"
+  ],
+  "image": [
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+    ".ico", ".jfif", ".avif", ".heic", ".heif", ".svg"
+  ],
+  "audio": [
+    ".aac", ".ac3", ".aif", ".amr", ".ape", ".flac", ".m4a", ".mid",
+    ".midi", ".mp2", ".mp3", ".ogg", ".wav", ".wma"
+  ]
+}

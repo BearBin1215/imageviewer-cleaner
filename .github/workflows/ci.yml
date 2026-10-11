@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 单元测试
+        run: cargo test --workspace
+
+      - name: 发布构建
+        run: cargo build --release -p imageviewer-cleaner-gui --features embed-font
+
+      - name: 体积门禁与单文件校验
+        shell: pwsh
+        run: |
+          $exe = "target/release/imageviewer-cleaner.exe"
+          if (-not (Test-Path $exe)) { throw "未找到发布产物" }
+
+          $mb = (Get-Item $exe).Length / 1MB
+          Write-Host ("产物体积: {0:N2} MB" -f $mb)
+          if ($mb -gt 8) { throw "体积超过 8 MB 门禁" }
+
+          # 单文件校验：发布目录不应出现运行期依赖。
+          # .pdb 是调试符号，不参与分发，因此不在检查范围内。
+          $stray = Get-ChildItem "target/release" -File |
+                    Where-Object { $_.Extension -in ".dll", ".lib", ".exp" }
+          if ($stray) {
+            Write-Host "发现 sidecar 文件："
+            $stray | ForEach-Object { Write-Host "  $($_.Name)" }
+            throw "发布产物不是单文件"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imageviewer-cleaner-x64
+          path: target/release/imageviewer-cleaner.exe

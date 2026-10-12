@@ -62,26 +62,6 @@ impl RegistryBackend for InMemoryRegistry {
         Ok(self.user_hives.lock().unwrap().clone())
     }
 
-    fn enum_subkeys(&self, path: &RegPath) -> Result<Vec<String>> {
-        let prefix = format!("{}\\", path.sub);
-        let mut out: Vec<String> = self
-            .keys
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|k| k.root == path.root && k.sub.starts_with(&prefix))
-            .filter_map(|k| {
-                k.sub[prefix.len()..]
-                    .split('\\')
-                    .next()
-                    .map(|s| s.to_owned())
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        Ok(out)
-    }
-
     fn read_string(&self, path: &RegPath, value: &str) -> Result<Option<String>> {
         Ok(self
             .keys
@@ -124,12 +104,12 @@ impl RegistryBackend for InMemoryRegistry {
         &self,
         path: &RegPath,
         name: Option<&str>,
-        value: &crate::regfile::RegValue,
+        value: &crate::sys::regfile::RegValue,
     ) -> Result<()> {
         let text = match value {
-            crate::regfile::RegValue::Str(s) => s.clone(),
-            crate::regfile::RegValue::Dword(v) => v.to_string(),
-            crate::regfile::RegValue::Binary(b) => format!("{b:?}"),
+            crate::sys::regfile::RegValue::Str(s) => s.clone(),
+            crate::sys::regfile::RegValue::Dword(v) => v.to_string(),
+            crate::sys::regfile::RegValue::Binary(b) => format!("{b:?}"),
         };
         InMemoryRegistry::set_value(self, path, name.unwrap_or(""), &text);
         Ok(())

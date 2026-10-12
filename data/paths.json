@@ -1,5 +1,5 @@
 {
-  "_comment": "候选安装路径（兜底用）。首选是进程镜像路径反查，次选是注册表 InstallDir —— 见 M0b §4.2 实测：该注册表键在部分机器上不存在。",
+  "_comment": "候选安装路径（兜底用）。首选是进程镜像路径反查，次选是注册表 InstallDir（该键在部分机器上不存在）。",
   "marker": "BaiduNetdisk.exe",
   "candidates": [
     "%ProgramFiles%\\Baidu\\BaiduNetdisk",
@@ -17,5 +17,17 @@
   "install_dir_registry_value": {
     "sub": "Software\\Baidu\\BaiduNetdisk",
     "value": "InstallDir"
-  }
+  },
+
+  "_comment_required": "主客户端完整性判据：清理结束后这些文件必须仍然存在，任一缺失即视为破坏了客户端，立即回滚。",
+  "required_files": [
+    "BaiduNetdisk.exe",
+    "module\\BrowserEngine\\BaiduNetdiskUnite.exe",
+    "module\\BrowserEngine\\resources\\app.asar"
+  ],
+
+  "_comment_placeholder": "占位目标：组件被清理后，在原位置放置相反类型的同名对象（原本是文件的位置放目录），阻断客户端重建。",
+  "placeholder_targets": [
+    { "component": "PlayerLauncher", "kind": "dir_instead_of_file" }
+  ]
 }

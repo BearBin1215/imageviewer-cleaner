@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::model::{RegItem, RegPath};
+use crate::model::{ComponentId, PlaceholderKind, RegItem, RegPath};
 
 const PATHS_JSON: &str = include_str!("../../../data/paths.json");
 const REGISTRY_JSON: &str = include_str!("../../../data/registry.json");
@@ -16,6 +16,17 @@ pub struct PathsTable {
     pub marker: String,
     pub candidates: Vec<String>,
     pub install_dir_registry_value: RegistryValueRef,
+    /// 清理后必须仍然存在的主客户端文件（相对安装目录）
+    pub required_files: Vec<String>,
+    /// 需要放置占位物的组件
+    pub placeholder_targets: Vec<PlaceholderTarget>,
+}
+
+/// 一个占位目标：组件清理后，在原位置放置相反类型的同名对象
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PlaceholderTarget {
+    pub component: ComponentId,
+    pub kind: PlaceholderKind,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,7 +168,7 @@ impl Tables {
         RegPath::user_classes(sid).join(ext).join("OpenWithList")
     }
 
-    /// UserChoice 子键路径（删除整个子键，而非改值）
+    /// UserChoice 子键路径（删除整个子键，不修改其中的值）
     pub fn user_choice_path(&self, sid: &str, ext: &str) -> RegPath {
         RegPath::user_software(sid)
             .join(&self.registry.userchoice_relative)
@@ -210,7 +221,7 @@ mod tests {
         assert_eq!(classes_key.path.root, crate::model::RegRoot::Hku);
         assert!(classes_key.value.is_none(), "整键删除，不带值名");
 
-        // RegisteredApplications 是「删值」而非「删键」
+        // RegisteredApplications 只删除值，不删除整个键
         let reg_app = items
             .iter()
             .find(|i| i.path.sub.contains("RegisteredApplications"))

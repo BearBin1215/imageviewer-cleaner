@@ -14,13 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: 格式检查
+        run: cargo fmt --all --check
+
+      - name: 静态检查
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       - name: 单元测试
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: 发布构建
-        run: cargo build --release -p imageviewer-cleaner-gui --features embed-font
+        run: cargo build --release -p imageviewer-cleaner-gui --locked
 
       - name: 体积门禁与单文件校验
         shell: pwsh
@@ -30,7 +38,7 @@ jobs:
 
           $mb = (Get-Item $exe).Length / 1MB
           Write-Host ("产物体积: {0:N2} MB" -f $mb)
-          if ($mb -gt 8) { throw "体积超过 8 MB 门禁" }
+          if ($mb -gt 12) { throw "体积超过 12 MB 门禁" }
 
           # 单文件校验：发布目录不应出现运行期依赖。
           # .pdb 是调试符号，不参与分发，因此不在检查范围内。

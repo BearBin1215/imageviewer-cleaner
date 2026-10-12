@@ -16,9 +16,6 @@ pub enum Error {
     #[error("目标被禁区保护拦截: {0}")]
     Forbidden(PathBuf),
 
-    #[error("文件被占用，无法移动: {0}")]
-    FileLocked(PathBuf),
-
     #[error("跨卷移动空间不足：需要 {need} 字节，可用 {free} 字节")]
     NoSpace { need: u64, free: u64 },
 
@@ -39,6 +36,9 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("注册表文件解析失败: {0}")]
+    RegFile(String),
 
     #[error("IO 失败 [{path}]: {source}")]
     Io {

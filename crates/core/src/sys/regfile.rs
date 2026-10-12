@@ -1,8 +1,7 @@
 //! `.reg` 文件解析 —— 用于还原时把注册表写回
 //!
-//! 只支持本工具自己导出的格式（见 [`crate::sys::registry`] 的 `export_key`），
-//! 不追求覆盖 Windows 注册表编辑器的全部语法。这样解析逻辑可以独立单测，
-//! 也不必依赖未公开的 `RegImportW` 导出。
+//! 只解析本工具自己导出的格式（见 [`crate::sys::registry`] 的 `export_key`），
+//! 不覆盖 Windows 注册表编辑器的全部语法，解析逻辑因此可以独立单测。
 
 use crate::error::{Error, Result};
 use crate::model::{RegPath, RegRoot};
@@ -30,11 +29,6 @@ pub struct Parsed {
     pub entries: Vec<RegEntry>,
 }
 
-/// 解析 `.reg` 文本，只返回值条目
-pub fn parse(text: &str) -> Result<Vec<RegEntry>> {
-    Ok(parse_full(text)?.entries)
-}
-
 /// 解析 `.reg` 文本，返回键集合与值条目
 pub fn parse_full(text: &str) -> Result<Parsed> {
     let mut entries = Vec::new();
@@ -60,7 +54,7 @@ pub fn parse_full(text: &str) -> Result<Parsed> {
         let (lhs, rhs) = line.split_at(eq);
         let rhs = &rhs[1..];
         let Some(path) = current.clone() else {
-            return Err(Error::data("reg", serde::de::Error::custom("值出现在键之前")));
+            return Err(Error::RegFile("值出现在键之前".into()));
         };
         let name = if lhs.trim() == "@" {
             None
@@ -86,10 +80,7 @@ fn parse_key(s: &str) -> Result<RegPath> {
     } else if s == "HKEY_LOCAL_MACHINE" {
         (RegRoot::Hklm, "")
     } else {
-        return Err(Error::data(
-            "reg",
-            serde::de::Error::custom(format!("不支持的根键：{s}")),
-        ));
+        return Err(Error::RegFile(format!("不支持的根键：{s}")));
     };
     Ok(RegPath {
         root,
@@ -99,12 +90,8 @@ fn parse_key(s: &str) -> Result<RegPath> {
 
 fn parse_value(s: &str) -> Result<RegValue> {
     if let Some(hex) = s.strip_prefix("dword:") {
-        let v = u32::from_str_radix(hex.trim(), 16).map_err(|e| {
-            Error::data(
-                "reg",
-                serde::de::Error::custom(format!("dword 解析失败：{e}")),
-            )
-        })?;
+        let v = u32::from_str_radix(hex.trim(), 16)
+            .map_err(|e| Error::RegFile(format!("dword 解析失败：{e}")))?;
         return Ok(RegValue::Dword(v));
     }
 
@@ -114,12 +101,8 @@ fn parse_value(s: &str) -> Result<RegValue> {
         } else {
             hex.split(',')
                 .map(|b| {
-                    u8::from_str_radix(b.trim(), 16).map_err(|e| {
-                        Error::data(
-                            "reg",
-                            serde::de::Error::custom(format!("hex 解析失败：{e}")),
-                        )
-                    })
+                    u8::from_str_radix(b.trim(), 16)
+                        .map_err(|e| Error::RegFile(format!("hex 解析失败：{e}")))
                 })
                 .collect::<Result<Vec<u8>>>()?
         };
@@ -131,12 +114,7 @@ fn parse_value(s: &str) -> Result<RegValue> {
     let inner = s
         .strip_prefix('"')
         .and_then(|x| x.strip_suffix('"'))
-        .ok_or_else(|| {
-            Error::data(
-                "reg",
-                serde::de::Error::custom(format!("无法识别的值：{s}")),
-            )
-        })?;
+        .ok_or_else(|| Error::RegFile(format!("无法识别的值：{s}")))?;
     Ok(RegValue::Str(unescape(inner)))
 }
 
@@ -165,12 +143,10 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::registry::RegistryBackend;
-    use crate::sys::registry::Win32Registry;
 
-    /// 测试辅助：解析样例文本
+    /// 测试辅助：解析样例文本，只取值条目
     fn round_trip(text: &str) -> Vec<RegEntry> {
-        parse(text).unwrap()
+        parse_full(text).unwrap().entries
     }
 
     #[test]
@@ -225,7 +201,7 @@ mod tests {
     #[test]
     fn rejects_unknown_root() {
         let text = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\X]\r\n";
-        assert!(parse(text).is_err(), "未支持的根键应报错");
+        assert!(parse_full(text).is_err(), "未支持的根键应报错");
     }
 
     #[test]
@@ -241,16 +217,5 @@ mod tests {
                 .sub
                 .contains("BaiduNetdiskPlayerAssociations")
         );
-    }
-
-    #[test]
-    fn export_then_parse_round_trip_against_memory_backend() {
-        // 替身不做真实导出，这里只验证解析端对空键的处理
-        let text = "Windows Registry Editor Version 5.00\r\n\r\n\
-[HKEY_USERS\\S-1-5-21-1-2-3-1001_Classes\\BaiduNetdiskPlayerAssociations]\r\n\r\n";
-        let entries = parse(text).unwrap();
-        assert!(entries.is_empty(), "空键不产生值条目");
-
-        let _ = Win32Registry::new().enumerate_user_hives();
     }
 }

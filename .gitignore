@@ -19,4 +19,5 @@ desktop.ini
 # 清理工具的运行时产物（隔离区/日志）
 backup/
 logs/
-imageviewer-cleaner/
+# 只忽略仓库根下的隔离区目录，避免误伤同名的源码目录
+/imageviewer-cleaner/

@@ -1,11 +1,12 @@
 //! 目标用户 SID 解析
 //!
-//! 注意：`GetUserNameW` + `LookupAccountNameW` 返回的是**机器 SID（缺 RID）**，
-//! 拿它访问 `HKU\<SID>` 会失败，因此本模块从 `HKEY_USERS` 的 hive 枚举入手。
+//! 用户 SID 从 `HKEY_USERS` 下已加载的 hive 枚举得到，不使用 `GetUserNameW`
+//! 与 `LookupAccountNameW`——后两者返回的是机器 SID（缺 RID），拿它访问
+//! `HKU\<SID>` 会失败。
 //!
-//! 首要判据是**「哪个 hive 下真的存在百度相关键」**，而不是「谁是当前用户」。
-//! 控制台用户仅在多个候选时用于消歧；仍无法确定时报错，交给界面让用户选择，
-//! **绝不静默猜测**（选错会导致清理了错误用户的关联，且用户毫无察觉）。
+//! 首要判据是哪个 hive 下真的存在百度相关键，而不看当前登录用户是谁。
+//! 控制台用户仅在多个候选时用于消歧；仍无法确定时返回错误，交给界面让用户选择，
+//! 不静默猜测（选错会清理错误用户的关联，且用户毫无察觉）。
 
 use crate::error::{Error, Result};
 use crate::model::RegPath;
@@ -72,10 +73,10 @@ pub fn candidate_user_hives(sys: &SysContext) -> Result<Vec<String>> {
     Ok(v)
 }
 
-/// 控制台/活动会话用户 SID（best-effort，仅用于消歧）
+/// 控制台/活动会话用户 SID（仅用于消歧，取不到时返回 None）
 ///
 /// 做法：找活动会话里的 `explorer.exe`，读它的令牌用户 SID。
-/// 比 `WTSQueryUserToken` 可靠（后者需要 `SeTcbPrivilege`，默认未启用）。
+/// 不使用 `WTSQueryUserToken`，因为它需要 `SeTcbPrivilege`，默认未启用。
 pub fn console_user_sid(sys: &SysContext) -> Option<String> {
     let session = crate::sys::process::active_console_session_id()?;
     let procs = sys.process.list().ok()?;
@@ -135,7 +136,6 @@ pub fn resolve_target_user_sid(sys: &SysContext) -> Result<String> {
 mod tests {
     use super::*;
     use crate::sys::mock::{FakeProcesses, InMemoryRegistry};
-    use crate::sys::shell::ShellBackend;
     use crate::sys::{SysContext, mock::NoopShell};
 
     fn ctx(reg: InMemoryRegistry, proc: FakeProcesses) -> SysContext {
@@ -202,7 +202,7 @@ mod tests {
             "S-1-5-21-1-2-3-1002".into(),
         ]);
         let sys = ctx(reg, p);
-        // 两个候选、都没有百度键 → 必须报错而不是猜一个
+        // 两个候选、都没有百度键 → 必须报错，不能猜一个
         assert!(matches!(
             resolve_target_user_sid(&sys),
             Err(Error::UserSidNotFound)
@@ -279,6 +279,4 @@ mod tests {
             Ok(Some(self.sid.clone()))
         }
     }
-
-    fn _assert_shell_trait_in_scope(_: &dyn ShellBackend) {}
 }

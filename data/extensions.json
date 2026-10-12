@@ -1,5 +1,5 @@
 {
-  "_comment": "来源：CSDN 2026-09 版清理脚本的扩展名清单，与 M0b 本机实测的 OpenWithList / UserChoice 行为一致。",
+  "_comment": "视频、图像、音频扩展名清单，用于构造 OpenWithList 与 UserChoice 的候选键路径。",
   "video": [
     ".264", ".265", ".3g2", ".3gp", ".avc", ".avi", ".avs", ".avs2", ".avs3", ".bik",
     ".bk2", ".dav", ".dif", ".dv", ".evc", ".f4v", ".flv", ".h261", ".h263", ".h264",

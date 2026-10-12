@@ -38,10 +38,10 @@ pub fn restore(
     Ok((m, report))
 }
 
-/// 逆序撤销一组动作。编排层回滚与事后还原共用这一套逻辑，避免两份实现漂移。
+/// 逆序撤销一组动作。编排层回滚与事后还原共用这一套逻辑，避免两处实现不一致。
 ///
 /// 逆序的意义：占位物在动作列表末尾（加固最后执行），逆序时先被移除，
-/// 这样随后把文件移回原位时不会被同名占位物挡住。整个过程尽力而为——
+/// 这样随后把文件移回原位时不会被同名占位物挡住。整个过程容错推进，
 /// 单项失败只记录、不中断，以便尽量多地恢复。
 pub fn undo_actions(sys: &SysContext, actions: &[Action], rep: &Reporter) -> RestoreReport {
     let mut report = RestoreReport::default();
@@ -210,7 +210,7 @@ mod tests {
 
         let (_, report) = restore(&sys, &q, &Reporter::silent()).unwrap();
         assert_eq!(report.files_restored, 0);
-        assert_eq!(report.files_skipped, 1, "原位已存在时应跳过而非覆盖");
+        assert_eq!(report.files_skipped, 1, "原位已存在时应跳过");
 
         let _ = std::fs::remove_dir_all(&base);
     }

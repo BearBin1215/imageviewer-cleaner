@@ -1,5 +1,5 @@
 {
-  "_comment": "百度的关联键实测落在 HKU\\<SID>_Classes，不在 HKLM（M0b §4.4）。因此两层都探测、两层都清理；HKLM 层为防御性（其他版本可能写全局）。严禁子串匹配 —— HKLM 下存在 Baiduyunguanjia（另一个产品）。",
+  "_comment": "百度的关联键位于 HKU\\<SID>_Classes，不在 HKLM。两层都探测、两层都清理；HKLM 层为其他版本预留（可能写全局）。不要用子串匹配 —— HKLM 下存在 Baiduyunguanjia（另一个产品）。",
 
   "user_classes_keys": [
     "BaiduNetdiskImageViewerAssociations",
@@ -39,6 +39,6 @@
     "BaiduNetdiskImageViewer.open"
   ],
 
-  "_comment_userchoice": "UserChoice 受 Windows 哈希保护，改值会被拒 → 必须删除整个子键，让系统重新询问。且无法精确还原。",
+  "_comment_userchoice": "UserChoice 受 Windows 哈希保护，改值会被拒绝，必须删除整个子键让系统重新询问；该键无法精确还原。",
   "userchoice_relative": "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts"
 }

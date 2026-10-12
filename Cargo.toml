@@ -14,12 +14,13 @@ windows = "0.62.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 
 # 体积优先的发布配置
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
+# 崩溃时不展开栈，省下展开相关代码。代价是没有回溯信息；
+# 本程序以 GUI 方式运行，崩溃会直接退出，回溯本来也不易获取。
 panic = "abort"
 strip = true

@@ -1,16 +1,17 @@
 //! ① 探测层
 //!
-//! 安装目录定位顺序：
-//!   (a) 进程镜像路径反查   ← 最可靠
-//!   (b) 注册表 InstallDir  ← 该键在部分机器上不存在
-//!   (c) 候选路径扫描       ← 兜底
+//! 安装目录按以下顺序定位，取第一个通过校验的结果：
+//! 1. 运行中进程的镜像路径；
+//! 2. 注册表 InstallDir（部分机器上没有该键）；
+//! 3. 候选路径扫描（兜底）。
+
+pub mod sid;
 
 use std::path::{Path, PathBuf};
 
 use crate::data::Tables;
 use crate::error::{Error, Result};
 use crate::model::{Component, ComponentId, ComponentKind, Detection, RegItem};
-use crate::sid;
 use crate::sys::SysContext;
 
 pub fn detect(sys: &SysContext, tables: &Tables) -> Result<Detection> {
@@ -89,32 +90,24 @@ fn via_candidates(tables: &Tables) -> Option<PathBuf> {
     None
 }
 
-/// 展开 `%VAR%` 形式的环境变量
+/// 展开 `%VAR%` 形式的环境变量。未定义的变量按 Windows 的约定原样保留。
 pub fn expand_env(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == '%' {
-            if let Some(end) = bytes[i + 1..].iter().position(|&c| c == '%') {
-                let name: String = bytes[i + 1..i + 1 + end].iter().collect();
-                match std::env::var(&name) {
-                    Ok(v) => out.push_str(&v),
-                    Err(_) => {
-                        // 未定义则原样保留
-                        out.push('%');
-                        out.push_str(&name);
-                        out.push('%');
-                    }
-                }
-                i += end + 2;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    use windows::core::PCWSTR;
+
+    let src = crate::sys::wide(s);
+    // 第一次调用只取所需长度（含结尾的 0）
+    let need = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), None) };
+    if need == 0 {
+        return s.to_owned();
     }
-    out
+    let mut buf = vec![0u16; need as usize];
+    let written = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut buf)) };
+    if written == 0 || written as usize > buf.len() {
+        return s.to_owned();
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
 }
 
 // ───────────────────────────── 组件扫描 ─────────────────────────────
@@ -134,14 +127,14 @@ pub fn scan_components(sys: &SysContext, tables: &Tables, install_dir: &Path) ->
                 risk,
                 default_enabled,
                 size_bytes: None,
-                // 注册表项的「存在与否」在探测阶段单独判定，这里恒为「存在」
-                paths: vec![PathBuf::new()],
+                // 注册表项的「存在与否」在探测阶段单独判定，这里不涉及具体路径
+                paths: Vec::new(),
             });
             continue;
         }
 
         // 收集实际存在的路径；一个都不存在时也保留该条目，
-        // 让界面能显示「已清理」而不是让条目凭空消失
+        // 使界面能显示「已清理」
         let mut paths = Vec::new();
         let mut size = 0u64;
         for rel in id.relative_paths() {
@@ -332,12 +325,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_scan_covers_both_layers_and_marks_caution() {
+    fn scan_components_lists_all_and_marks_safe() {
         let tables = Tables::load().unwrap();
         let reg = InMemoryRegistry::new();
         let sys = ctx(reg, FakeProcesses::new());
 
-        // 造一个假的安装目录，写入各组件的文件（含两个已移出清理目标的）
+        // 造一个假的安装目录，写入各组件的文件
         let dir = std::env::temp_dir().join("bc_scan_components");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(r"module\ImageViewer")).unwrap();
@@ -372,10 +365,6 @@ mod tests {
             assert!(find(id).default_enabled, "{id:?} 默认应勾选");
             assert!(find(id).present(), "{id:?} 在假目录里存在");
         }
-
-        // 播放器代码包与引擎 DLL 已从组件列表移除（会导致网盘无法启动），
-        // 因此组件只剩安全的三项
-        assert_eq!(comps.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

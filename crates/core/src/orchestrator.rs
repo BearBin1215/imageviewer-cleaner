@@ -22,9 +22,8 @@ pub struct CleanupConfig {
     pub selected: Vec<ComponentId>,
     /// 是否建立占位物阻止重新部署。
     ///
-    /// 默认**开启**：真机实测占位法不会导致客户端启动失败，而它是阻断
-    /// 组件被重新下载部署的主力手段。若个别环境下仍出现异常，可关闭本项，
-    /// 或清理后用「还原」恢复。
+    /// 默认开启：占位法不会导致客户端启动失败，是阻断组件被重新下载部署的
+    /// 主要手段。若个别环境下仍出现异常，可关闭本项，或清理后用「还原」恢复。
     pub harden: bool,
     /// 覆盖隔离区根目录。默认取安装目录所在卷下的 `imageviewer-cleaner\quarantine`。
     /// 测试用它指向临时目录。
@@ -88,8 +87,9 @@ pub fn run_cleanup(
 
     match mutate(sys, tables, cfg, &d, &q, &mut journal, rep) {
         Ok(()) => {
-            let summary = summarize(&journal);
+            let mut summary = summarize(&journal);
             let m = journal.finish()?;
+            summary.quarantine_dir = Some(m.quarantine_dir.clone());
             rep.success(format!("隔离区：{}", m.quarantine_dir.display()));
             Ok(summary)
         }
@@ -130,7 +130,7 @@ fn mutate(
     rep.stage(Stage::Harden);
     if cfg.harden {
         let before = journal.actions().len();
-        harden::apply(sys, &d.install_dir, journal)?;
+        harden::apply(sys, tables, &d.install_dir, journal)?;
         let n = journal.actions().len() - before;
         if n > 0 {
             rep.success(format!("已建立 {n} 个占位物，阻断重新部署"));
@@ -142,7 +142,7 @@ fn mutate(
     rep.stage(Stage::Refresh);
     clean::refresh(sys);
     rep.stage(Stage::Verify);
-    clean::verify(sys, &d.install_dir)?;
+    clean::verify(sys, tables, &d.install_dir)?;
     rep.success("主客户端完整性校验通过");
     Ok(())
 }
@@ -162,13 +162,12 @@ fn summarize(j: &Journal) -> Summary {
             }
             Action::FileMoved { .. } => s.files_moved += 1,
             Action::PlaceholderCreated { .. } => s.placeholders_created += 1,
-            Action::AclDenied { .. } => {}
         }
     }
     s
 }
 
-/// 回滚已完成的动作（复用还原层的逆序撤销逻辑，避免两份实现漂移）。
+/// 回滚已完成的动作（复用还原层的逆序撤销逻辑，避免两处实现不一致）。
 fn rollback(sys: &SysContext, actions: &[Action], rep: &Reporter) -> usize {
     let report = restore::undo_actions(sys, actions, rep);
     if actions
@@ -184,7 +183,7 @@ fn rollback(sys: &SysContext, actions: &[Action], rep: &Reporter) -> usize {
 fn discard_quarantine_if_rolled_back(q: &Quarantine, actions: &[Action], undone: usize) {
     let reversible = actions
         .iter()
-        .filter(|a| !matches!(a, Action::ProcessKilled { .. } | Action::AclDenied { .. }))
+        .filter(|a| !matches!(a, Action::ProcessKilled { .. }))
         .count();
     if undone >= reversible {
         let _ = std::fs::remove_dir_all(&q.dir);
@@ -194,16 +193,10 @@ fn discard_quarantine_if_rolled_back(q: &Quarantine, actions: &[Action], undone:
 /// 从最近一次备份还原
 pub fn run_restore(sys: &SysContext, quarantine_dir: &Path, rep: &Reporter) -> Result<()> {
     rep.stage(Stage::Backup);
-    let q = Quarantine {
-        dir: quarantine_dir.to_path_buf(),
-        install_dir: PathBuf::new(),
-    };
+    let q = Quarantine::at(quarantine_dir, PathBuf::new());
     // install_dir 由 manifest 提供，这里只是为了构造读取入口
     let m = q.read_manifest()?;
-    let q = Quarantine {
-        dir: quarantine_dir.to_path_buf(),
-        install_dir: m.install_dir.clone(),
-    };
+    let q = Quarantine::at(quarantine_dir, m.install_dir.clone());
 
     rep.info(format!("从 {} 还原", q.dir.display()));
     let (_, report) = restore::restore(sys, &q, rep)?;
@@ -226,6 +219,15 @@ pub fn run_detect(sys: &SysContext, tables: &Tables, rep: &Reporter) -> Result<D
     rep.success(format!("安装目录：{}", d.install_dir.display()));
     rep.success(format!("目标用户：{}", d.target_user_sid));
     Ok(d)
+}
+
+/// 定位安装目录，并列出该处可用的备份（最近的排在前面）。
+///
+/// 界面用它刷新「还原 / 删除备份」可用的列表，无需自行拼装探测与备份逻辑。
+pub fn locate_backups(sys: &SysContext, tables: &Tables, sid: &str) -> Result<Vec<PathBuf>> {
+    let install_dir = detect::locate_install_dir(sys, tables, sid)?;
+    let root = backup::default_root(&install_dir)?;
+    Ok(backup::list_backups(&root))
 }
 
 #[cfg(test)]
@@ -304,12 +306,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&qroot);
 
         // 显式启用加固，以便覆盖占位物的建立与还原
-        let cfg = CleanupConfig::new(vec![
-            ComponentId::ImageViewer,
-            ComponentId::PlayerLauncher,
-        ])
-        .with_harden(true)
-        .with_quarantine_root(qroot.clone());
+        let cfg = CleanupConfig::new(vec![ComponentId::ImageViewer, ComponentId::PlayerLauncher])
+            .with_harden(true)
+            .with_quarantine_root(qroot.clone());
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
         // 目录内容 2 项（入口程序 + 运行时 DLL）+ 启动器 1 项

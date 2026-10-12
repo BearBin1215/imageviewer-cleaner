@@ -1,7 +1,7 @@
-//! 禁区保护 —— 每次删除前必经的闸门
+//! 禁区保护 —— 每次删除前的强制校验
 //!
 //! 主客户端与播放器共享 `module\BrowserEngine`，误删会导致网盘无法启动。
-//! 本模块采用「精确匹配 + 前缀禁区 + 例外白名单」三层判定。
+//! 判定由精确匹配、前缀禁区和例外白名单三部分组合而成。
 
 use std::path::Path;
 
@@ -36,10 +36,10 @@ pub fn is_forbidden(t: &ForbiddenTable, relative: &str) -> bool {
     false
 }
 
-/// 删除前的硬闸门：目标必须位于安装目录内，且不得命中禁区
+/// 删除前的强制校验：目标必须位于安装目录内，且不得命中禁区
 pub fn assert_not_forbidden(t: &ForbiddenTable, install_dir: &Path, target: &Path) -> Result<()> {
     let Ok(rel) = target.strip_prefix(install_dir) else {
-        // 不在安装目录内 —— 一律拒绝（防止路径穿越/误配置）
+        // 不在安装目录内时一律拒绝，防止路径穿越或误配置
         return Err(Error::Forbidden(target.to_path_buf()));
     };
     if is_forbidden(t, &rel.to_string_lossy()) {

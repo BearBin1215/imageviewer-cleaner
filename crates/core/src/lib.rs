@@ -1,7 +1,8 @@
 //! 百度网盘捆绑组件清理工具 · 核心逻辑
 //!
-//! 本 crate **不依赖 GUI**，可独立单测。所有系统操作通过 [`sys::SysContext`] 注入，
-//! 使「进程反查 → 注册表 → 候选路径」三路探测都能在测试里被驱动，不碰真实系统。
+//! 本 crate 不依赖 GUI，可独立单测。进程、注册表、文件系统、Shell 四类后端经
+//! [`sys::SysContext`] 注入，探测与清理的主流程因此能在测试里被完整驱动；
+//! 少数辅助操作（原子写 manifest、取本地时间、读取目录项）直接调用系统 API。
 //!
 //! 分层：
 //! - [`detect`] ① 探测层：定位安装目录、解析目标用户、扫描组件与关联
@@ -21,9 +22,7 @@ pub mod harden;
 pub mod model;
 pub mod orchestrator;
 pub mod progress;
-pub mod regfile;
 pub mod restore;
-pub mod sid;
 pub mod sys;
 
 pub use error::{Error, Result};

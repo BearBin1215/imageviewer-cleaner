@@ -3,10 +3,11 @@
 //! egui 是即时模式，`App::ui()` 每帧在主线程执行；清理必须跑在 worker 线程，
 //! 通过本模块把进度送回 UI，并触发一次重绘唤醒。
 
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crate::error::Error;
-use crate::model::{Action, Detection};
+use crate::model::Detection;
 
 #[derive(Debug)]
 pub enum Progress {
@@ -18,8 +19,6 @@ pub enum Progress {
         level: Level,
         text: String,
     },
-    /// 已完成一个动作（同步写入 manifest）
-    Action(Box<Action>),
     Finished(Result<Summary, Error>),
 }
 
@@ -67,6 +66,8 @@ pub struct Summary {
     pub placeholders_created: usize,
     /// 因占用/权限等原因被跳过、未能处理的项数（非致命）
     pub failed: usize,
+    /// 本次清理的隔离区目录（供界面直接展示，无需再次扫描）
+    pub quarantine_dir: Option<PathBuf>,
 }
 
 /// 上报器：每次 `emit` 后触发一次「唤醒 UI」回调
@@ -120,10 +121,6 @@ impl Reporter {
             level,
             text: text.into(),
         });
-    }
-
-    pub fn action(&self, a: Action) {
-        self.emit(Progress::Action(Box::new(a)));
     }
 }
 

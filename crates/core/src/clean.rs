@@ -15,7 +15,7 @@ use crate::progress::Reporter;
 use crate::sys::SysContext;
 use crate::sys::process::ProcessInfo;
 
-/// 清理参数。超时可覆盖，便于测试时不必真等十秒。
+/// 清理参数。超时可覆盖，测试时置 0 即可跳过等待。
 #[derive(Debug, Clone)]
 pub struct CleanOptions {
     pub graceful_timeout_ms: u64,
@@ -33,8 +33,8 @@ impl CleanOptions {
 
 /// 结束目标进程
 ///
-/// 要点：向全部目标**一次性**广播关闭请求，然后在**单个**超时窗口内轮询，
-/// 而不是逐个等待——播放器实测可能同时存在多个实例，逐个等待会拖很久。
+/// 向全部目标一次性发出关闭请求，然后在同一个超时窗口内轮询：
+/// 播放器可能同时存在多个实例，逐个等待会显著拉长时间。
 pub fn kill_processes(
     sys: &SysContext,
     tables: &Tables,
@@ -117,6 +117,23 @@ fn still_alive(sys: &SysContext, targets: &[ProcessInfo]) -> Result<Vec<ProcessI
         .collect())
 }
 
+/// 当前正在运行的目标进程名，去重后按名称排序。
+///
+/// 界面用它提示用户先手动退出网盘：强制结束会被网盘记成异常退出。
+pub fn running_targets(sys: &SysContext, tables: &Tables) -> Vec<String> {
+    let mut names: Vec<String> = sys
+        .process
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| tables.processes.is_target(&p.name))
+        .map(|p| p.name)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// 断开关联。先导出再删除，顺序不能反。
 ///
 /// 只处理实际存在的项——探测阶段会列出全部候选，多数并不存在。
@@ -130,7 +147,12 @@ pub fn break_associations(
     let mut cleared = 0usize;
     for item in items {
         let exists = match &item.value {
-            Some(v) => sys.registry.read_string(&item.path, v).ok().flatten().is_some(),
+            Some(v) => sys
+                .registry
+                .read_string(&item.path, v)
+                .ok()
+                .flatten()
+                .is_some(),
             None => sys.registry.key_exists(&item.path).unwrap_or(false),
         };
         if !exists {
@@ -182,7 +204,7 @@ fn reg_action(item: &RegItem, exported: std::path::PathBuf) -> Action {
     }
 }
 
-/// 把选中的组件移入隔离区。每个目标都要先过禁区闸门。
+/// 把选中的组件移入隔离区。每个目标都要先通过禁区校验。
 pub fn move_files(
     sys: &SysContext,
     tables: &Tables,
@@ -207,7 +229,7 @@ pub fn move_files(
                 for e in entries.flatten() {
                     let child_rel = format!("{rel}\\{}", e.file_name().to_string_lossy());
                     let child = install_dir.join(&child_rel);
-                    // 禁区命中是致命错误：绝不越过安全闸门
+                    // 禁区命中是致命错误：直接返回错误，不做任何删除
                     guard::assert_not_forbidden(&tables.forbidden, install_dir, &child)?;
                     if !sys.fs.exists(&child) {
                         continue;
@@ -256,16 +278,13 @@ pub fn refresh(sys: &SysContext) {
     sys.shell.notify_assoc_changed();
 }
 
-/// 校验主客户端仍然完整。任一关键文件缺失都要立刻告警。
-pub fn verify(sys: &SysContext, install_dir: &Path) -> Result<()> {
-    const REQUIRED: &[&str] = &[
-        "BaiduNetdisk.exe",
-        r"module\BrowserEngine\BaiduNetdiskUnite.exe",
-        r"module\BrowserEngine\resources\app.asar",
-    ];
-    for rel in REQUIRED {
+/// 校验主客户端仍然完整。任一关键文件缺失都返回错误，由编排层触发回滚。
+///
+/// 判据清单来自 `data/paths.json` 的 `required_files`。
+pub fn verify(sys: &SysContext, tables: &Tables, install_dir: &Path) -> Result<()> {
+    for rel in &tables.paths.required_files {
         if !sys.fs.exists(&install_dir.join(rel)) {
-            return Err(Error::ClientIntegrityBroken((*rel).to_owned()));
+            return Err(Error::ClientIntegrityBroken(rel.clone()));
         }
     }
     Ok(())
@@ -379,7 +398,16 @@ mod tests {
 
         let selected = vec![ComponentId::ImageViewer];
         let mut j = journal();
-        move_files(&sys, &tables, &dir, &selected, &q, &mut j, &Reporter::silent()).unwrap();
+        move_files(
+            &sys,
+            &tables,
+            &dir,
+            &selected,
+            &q,
+            &mut j,
+            &Reporter::silent(),
+        )
+        .unwrap();
 
         // 顶层条目：Qt5Core.dll 与 subdir，各算一个动作（子目录整体移动）
         assert_eq!(j.actions().len(), 2, "顶层条目数");
@@ -426,7 +454,20 @@ mod tests {
     }
 
     #[test]
+    fn running_targets_filters_to_whitelist() {
+        let tables = Tables::load().unwrap();
+        let proc = FakeProcesses::new();
+        proc.add("BaiduNetdisk.exe", 100, None);
+        proc.add("BaiduNetdisk.exe", 101, None); // 同名多实例应合并为一项
+        proc.add("explorer.exe", 300, None);
+
+        let sys = sys_with(InMemoryRegistry::new(), proc);
+        assert_eq!(running_targets(&sys, &tables), vec!["BaiduNetdisk.exe"]);
+    }
+
+    #[test]
     fn verify_detects_missing_client_files() {
+        let tables = Tables::load().unwrap();
         let dir = std::env::temp_dir().join("bc_clean_verify");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(r"module\BrowserEngine\resources")).unwrap();
@@ -434,7 +475,7 @@ mod tests {
         let sys = sys_with(InMemoryRegistry::new(), FakeProcesses::new());
         // 什么都缺 → 必须报错
         assert!(matches!(
-            verify(&sys, &dir),
+            verify(&sys, &tables, &dir),
             Err(Error::ClientIntegrityBroken(_))
         ));
 
@@ -446,7 +487,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join(r"module\BrowserEngine\resources\app.asar"), b"x").unwrap();
-        assert!(verify(&sys, &dir).is_ok());
+        assert!(verify(&sys, &tables, &dir).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

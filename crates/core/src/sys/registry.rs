@@ -1,8 +1,9 @@
 //! 注册表后端 —— trait 抽象 + Win32 实现
 //!
-//! `HKCR` 是 `HKLM\Software\Classes` 与**当前用户** Classes 的合并视图。
-//! 工具以管理员身份运行时「当前用户」是管理员，**直接删 `HKCR\BaiduNetdisk*` 不会命中**。
-//! 因此本层只接受**已解析的绝对路径**（`RegPath`），由上层显式指定 `HKU\<SID>_Classes` 等。
+//! `HKCR` 是 `HKLM\Software\Classes` 与当前用户 Classes 的合并视图。
+//! 工具以管理员身份运行时，「当前用户」是管理员，因此删除 `HKCR\BaiduNetdisk*`
+//! 命不中目标。本层只接受已解析的绝对路径（`RegPath`），由上层显式指定
+//! `HKU\<SID>_Classes` 等具体位置。
 
 use std::path::Path;
 
@@ -10,20 +11,19 @@ use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD,
     REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
-    RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW,
+    RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
 use crate::error::{Error, Result};
 use crate::model::{RegPath, RegRoot};
-use crate::regfile::{RegValue, parse_full};
+use crate::sys::regfile::{RegValue, parse_full};
+use crate::sys::wide;
 
 pub trait RegistryBackend: Send + Sync {
     /// 枚举 `HKEY_USERS` 下已加载的 hive 名（如 `S-1-5-21-...-1001`、`...-1001_Classes`）
     fn enumerate_user_hives(&self) -> Result<Vec<String>>;
 
-    fn enum_subkeys(&self, path: &RegPath) -> Result<Vec<String>>;
     fn read_string(&self, path: &RegPath, value: &str) -> Result<Option<String>>;
     fn key_exists(&self, path: &RegPath) -> Result<bool>;
     /// 删除整个键（含子键）
@@ -37,10 +37,6 @@ pub trait RegistryBackend: Send + Sync {
     fn set_value(&self, path: &RegPath, name: Option<&str>, value: &RegValue) -> Result<()>;
     /// 从 `.reg` 文件还原
     fn import_reg_file(&self, path: &Path) -> Result<()>;
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn root_handle(root: RegRoot) -> HKEY {
@@ -67,7 +63,7 @@ impl Win32Registry {
         Self
     }
 
-    unsafe fn open(&self, path: &RegPath, write: bool) -> Result<Option<HKEY>> {
+    fn open(&self, path: &RegPath, write: bool) -> Result<Option<HKEY>> {
         let mut hk = HKEY::default();
         let sub = wide(&path.sub);
         let access = if write { KEY_WRITE } else { KEY_READ };
@@ -86,7 +82,7 @@ impl Win32Registry {
         Ok(Some(hk))
     }
 
-    unsafe fn enum_subkeys_h(&self, hk: HKEY) -> Result<Vec<String>> {
+    fn enum_subkeys_h(&self, hk: HKEY) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut idx = 0u32;
         loop {
@@ -114,16 +110,15 @@ impl Win32Registry {
     }
 
     /// 枚举键下的所有 (名称, 类型, 原始数据)
-    unsafe fn enum_values(&self, hk: HKEY) -> Result<Vec<(String, REG_VALUE_TYPE, Vec<u8>)>> {
+    fn enum_values(&self, hk: HKEY) -> Result<Vec<(String, REG_VALUE_TYPE, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut idx = 0u32;
         loop {
             let mut name = [0u16; 512];
             let mut name_len = name.len() as u32;
-            // RegEnumValueW 的 lptype 形参是 *mut u32，不是 REG_VALUE_TYPE
             let mut ty_raw: u32 = REG_SZ.0;
             let mut cb: u32 = 0;
-            // 第一趟：取大小
+            // 第一趟只取数据大小
             let rc = unsafe {
                 RegEnumValueW(
                     hk,
@@ -176,23 +171,11 @@ impl Default for Win32Registry {
 
 impl RegistryBackend for Win32Registry {
     fn enumerate_user_hives(&self) -> Result<Vec<String>> {
-        let rc = unsafe { self.enum_subkeys_h(HKEY_USERS) }?;
-        Ok(rc)
-    }
-
-    fn enum_subkeys(&self, path: &RegPath) -> Result<Vec<String>> {
-        match unsafe { self.open(path, false)? } {
-            None => Ok(Vec::new()),
-            Some(hk) => {
-                let r = unsafe { self.enum_subkeys_h(hk) };
-                let _ = unsafe { RegCloseKey(hk) };
-                r
-            }
-        }
+        self.enum_subkeys_h(HKEY_USERS)
     }
 
     fn read_string(&self, path: &RegPath, value: &str) -> Result<Option<String>> {
-        let Some(hk) = (unsafe { self.open(path, false)? }) else {
+        let Some(hk) = self.open(path, false)? else {
             return Ok(None);
         };
         let vn = wide(value);
@@ -238,7 +221,7 @@ impl RegistryBackend for Win32Registry {
     }
 
     fn key_exists(&self, path: &RegPath) -> Result<bool> {
-        match unsafe { self.open(path, false)? } {
+        match self.open(path, false)? {
             None => Ok(false),
             Some(hk) => {
                 let _ = unsafe { RegCloseKey(hk) };
@@ -265,7 +248,7 @@ impl RegistryBackend for Win32Registry {
     }
 
     fn delete_value(&self, path: &RegPath, value: &str) -> Result<()> {
-        let Some(hk) = (unsafe { self.open(path, true)? }) else {
+        let Some(hk) = self.open(path, true)? else {
             return Ok(()); // 键不存在，幂等成功
         };
         let vn = wide(value);
@@ -301,11 +284,11 @@ impl RegistryBackend for Win32Registry {
     }
 
     fn export_key(&self, path: &RegPath, out: &Path) -> Result<()> {
-        let Some(hk) = (unsafe { self.open(path, false)? }) else {
+        let Some(hk) = self.open(path, false)? else {
             return Ok(()); // 键不存在，无需导出
         };
         let mut text = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-        let r = unsafe { self.export_recursive(hk, path, &mut text) };
+        let r = self.export_recursive(hk, path, &mut text);
         let _ = unsafe { RegCloseKey(hk) };
         r?;
         std::fs::write(out, text.as_bytes()).map_err(|e| Error::io(out, e))
@@ -313,7 +296,7 @@ impl RegistryBackend for Win32Registry {
 
     fn set_value(&self, path: &RegPath, name: Option<&str>, value: &RegValue) -> Result<()> {
         self.create_key(path)?;
-        let Some(hk) = (unsafe { self.open(path, true)? }) else {
+        let Some(hk) = self.open(path, true)? else {
             return Err(Error::io(
                 std::path::PathBuf::from(path.full()),
                 std::io::Error::other("创建键之后仍无法打开"),
@@ -360,7 +343,7 @@ impl RegistryBackend for Win32Registry {
 
 impl Win32Registry {
     /// 递归导出为 .reg 文本
-    unsafe fn export_recursive(&self, hk: HKEY, path: &RegPath, out: &mut String) -> Result<()> {
+    fn export_recursive(&self, hk: HKEY, path: &RegPath, out: &mut String) -> Result<()> {
         out.push_str(&format!(
             "[{}]\r\n",
             path.full()
@@ -368,7 +351,7 @@ impl Win32Registry {
                 .replace("HKLM\\", "HKEY_LOCAL_MACHINE\\")
         ));
 
-        for (name, ty, data) in unsafe { self.enum_values(hk) }? {
+        for (name, ty, data) in self.enum_values(hk)? {
             let rendered = render_value(ty, &data);
             if name.is_empty() {
                 out.push_str(&format!("@={rendered}\r\n"));
@@ -381,7 +364,7 @@ impl Win32Registry {
         }
         out.push_str("\r\n");
 
-        for sub in unsafe { self.enum_subkeys_h(hk) }? {
+        for sub in self.enum_subkeys_h(hk)? {
             let mut child = HKEY::default();
             let sn = wide(&sub);
             let rc =
@@ -390,7 +373,7 @@ impl Win32Registry {
                 continue;
             }
             let child_path = path.join(&sub);
-            let r = unsafe { self.export_recursive(child, &child_path, out) };
+            let r = self.export_recursive(child, &child_path, out);
             let _ = unsafe { RegCloseKey(child) };
             r?;
         }
@@ -423,5 +406,3 @@ fn render_value(ty: REG_VALUE_TYPE, data: &[u8]) -> String {
         }
     }
 }
-
-

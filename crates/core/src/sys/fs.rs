@@ -27,9 +27,6 @@ pub trait FsBackend: Send + Sync {
     /// 路径所在卷的可用空间
     fn free_space(&self, p: &Path) -> Result<u64>;
     fn same_volume(&self, a: &Path, b: &Path) -> bool;
-    /// 路径所在卷的根，如 `D:\`。
-    /// 隔离区必须落在安装目录所在的卷上，否则移动会退化成跨卷复制。
-    fn volume_root(&self, p: &Path) -> Result<PathBuf>;
     /// 设置隐藏属性（Windows）
     fn set_hidden(&self, p: &Path) -> Result<()>;
     /// 移动（同卷为原子改名；跨卷为 copy+校验+删源）
@@ -44,11 +41,7 @@ pub trait FsBackend: Send + Sync {
 }
 
 fn volume_of(p: &Path) -> Option<String> {
-    let w = p
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<u16>>();
+    let w = crate::sys::wide(&p.to_string_lossy());
     let mut buf = [0u16; 260];
     if unsafe { GetVolumePathNameW(PCWSTR(w.as_ptr()), &mut buf) }.is_err() {
         return None;
@@ -117,11 +110,7 @@ impl FsBackend for Win32Fs {
                 }
             }
         }
-        let w = probe
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<u16>>();
+        let w = crate::sys::wide(&probe.to_string_lossy());
         let mut free = 0u64;
         let mut total = 0u64;
         let ok = unsafe {
@@ -148,29 +137,9 @@ impl FsBackend for Win32Fs {
         }
     }
 
-    fn volume_root(&self, p: &Path) -> Result<PathBuf> {
-        // 向上找到已存在的祖先，再取它所在的卷
-        let mut probe = p.to_path_buf();
-        while !probe.exists() {
-            match probe.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => probe = parent.to_path_buf(),
-                _ => break,
-            }
-        }
-        volume_of(&probe)
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::io(p, std::io::Error::other("无法确定所在卷")))
-    }
-
     fn set_hidden(&self, p: &Path) -> Result<()> {
-        use windows::Win32::Storage::FileSystem::{
-            SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN,
-        };
-        let w = p
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<u16>>();
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+        let w = crate::sys::wide(&p.to_string_lossy());
         unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }
             .map_err(|e| Error::win32(format!("SetFileAttributesW({})", p.display()), e))
     }
@@ -195,13 +164,13 @@ impl FsBackend for Win32Fs {
             });
         }
 
-        // 跨卷：先查空间 → copy → 校验大小 → 删源；任一步失败整体回滚
+        // 跨卷移动：依次检查空间、复制、校验大小、删除源文件，任一步失败则整体回滚
         let free = self.free_space(to)?;
         if free < bytes {
             return Err(Error::NoSpace { need: bytes, free });
         }
 
-        let staged = copy_recursive(from, to).map_err(|e| Error::io(from, e))?;
+        copy_recursive(from, to).map_err(|e| Error::io(from, e))?;
         let copied = dir_size(to).unwrap_or(0);
         if copied != bytes {
             let _ = std::fs::remove_dir_all(to);
@@ -213,7 +182,6 @@ impl FsBackend for Win32Fs {
                 )),
             ));
         }
-        let _ = staged;
 
         // 校验通过才删源
         if from.is_dir() {

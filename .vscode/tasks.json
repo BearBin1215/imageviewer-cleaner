@@ -2,6 +2,60 @@
   "version": "2.0.0",
   "tasks": [
     {
+      // 改动即重建并重启窗口，等价于 tauri dev 的后端部分
+      "label": "开发（watch 自动重建重启）",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "tools/dev.ps1"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "close": false
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      // 不弹界面，只验证探测逻辑，结果写入 scan-output.txt
+      "label": "开发（watch · 无界面自检）",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "tools/dev.ps1", "-Scan"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      // 需要 cargo install cargo-watch；与上面的脚本二选一
+      "label": "开发（cargo-watch）",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "watch",
+        "-w",
+        "crates",
+        "-w",
+        "data",
+        "-x",
+        "run -p imageviewer-cleaner-gui --features dev-no-elevation"
+      ],
+      "problemMatcher": [],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
       "label": "构建（debug，免提权）",
       "type": "shell",
       "command": "cargo",
@@ -13,10 +67,8 @@
         "dev-no-elevation"
       ],
       "problemMatcher": ["$rustc"],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      }
+      // 默认构建键让给 watch 任务；本任务仍按 label 被 launch.json 引用
+      "group": "build"
     },
     {
       "label": "构建（release，需提权）",

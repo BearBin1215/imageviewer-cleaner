@@ -1,12 +1,11 @@
 //! 进程后端 —— trait 抽象 + Win32 实现
 //!
-//! 实测要点：
-//! - `BaiduNetdiskUnite.exe` 可能**同时存在多个实例** → 必须按名全量枚举
-//! - `YunDetectService.exe` 等**无顶层窗口**，收不到 `WM_CLOSE` → 需容许直接终止
-//! - 这些进程**不是 SCM 服务**，服务分支仅为防御性保留
+//! 目标进程的几点事实：
+//! - `BaiduNetdiskUnite.exe` 可能同时存在多个实例，因此按名全量枚举。
+//! - `YunDetectService.exe` 等没有顶层窗口，收不到 `WM_CLOSE`，需要容许直接终止。
+//! - 这些进程都不是 SCM 服务，服务分支为其他版本预留。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -27,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR};
 
 use crate::error::{Error, Result};
+use crate::sys::wide;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
@@ -56,10 +56,6 @@ pub fn active_console_session_id() -> Option<u32> {
     use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
     let s = unsafe { WTSGetActiveConsoleSessionId() };
     if s == u32::MAX { None } else { Some(s) }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 // ───────────────────────────────── Win32 实现 ─────────────────────────────────
@@ -128,25 +124,27 @@ impl ProcessBackend for Win32Process {
     }
 
     fn request_close(&self, pid: u32) -> Result<bool> {
-        static TARGET: AtomicU32 = AtomicU32::new(0);
-        static FOUND: AtomicBool = AtomicBool::new(false);
+        /// 回调上下文。用 `LPARAM` 传递，避免使用全局可变状态，
+        /// 这样函数可重入、可并发调用。
+        struct Ctx {
+            pid: u32,
+            found: bool,
+        }
 
-        TARGET.store(pid, Ordering::SeqCst);
-        FOUND.store(false, Ordering::SeqCst);
-
-        unsafe extern "system" fn cb(hwnd: HWND, _l: LPARAM) -> BOOL {
-            let target = TARGET.load(Ordering::SeqCst);
+        unsafe extern "system" fn cb(hwnd: HWND, l: LPARAM) -> BOOL {
+            let ctx = unsafe { &mut *(l.0 as *mut Ctx) };
             let mut owner = 0u32;
             let _ = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
-            if owner == target && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            if owner == ctx.pid && unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-                FOUND.store(true, Ordering::SeqCst);
+                ctx.found = true;
             }
             BOOL(1) // 继续枚举
         }
 
-        let _ = unsafe { EnumWindows(Some(cb), LPARAM(0)) };
-        Ok(FOUND.load(Ordering::SeqCst))
+        let mut ctx = Ctx { pid, found: false };
+        let _ = unsafe { EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize)) };
+        Ok(ctx.found)
     }
 
     fn terminate(&self, pid: u32) -> Result<()> {
@@ -164,9 +162,15 @@ impl ProcessBackend for Win32Process {
                 Err(_) => return Ok(false),
             };
         let n = wide(name);
-        let ok = unsafe { OpenServiceW(scm, PCWSTR(n.as_ptr()), SERVICE_QUERY_STATUS) }.is_ok();
+        let svc = unsafe { OpenServiceW(scm, PCWSTR(n.as_ptr()), SERVICE_QUERY_STATUS) };
         let _ = unsafe { CloseServiceHandle(scm) };
-        Ok(ok)
+        match svc {
+            Ok(svc) => {
+                let _ = unsafe { CloseServiceHandle(svc) };
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     fn stop_service(&self, name: &str) -> Result<()> {
@@ -271,31 +275,16 @@ impl ProcessBackend for Win32Process {
     }
 }
 
-/// 手工把 SID 结构格式化为 `S-1-5-21-...` 字符串
-/// （避免 `ConvertSidToStringSidW` + `LocalFree` 的内存管理负担）
+/// 把 SID 结构格式化为 `S-1-5-21-...` 字符串
 fn sid_to_string(sid: windows::Win32::Security::PSID) -> Option<String> {
-    let p = sid.0 as *const u8;
-    if p.is_null() {
-        return None;
-    }
-    unsafe {
-        let rev = *p;
-        let count = *p.add(1) as usize;
-        let mut authority: u64 = 0;
-        for i in 0..6 {
-            authority = (authority << 8) | *p.add(2 + i) as u64;
-        }
-        let mut s = format!("S-{rev}-{authority}");
-        for i in 0..count {
-            let off = 8 + i * 4;
-            let v = u32::from_le_bytes([
-                *p.add(off),
-                *p.add(off + 1),
-                *p.add(off + 2),
-                *p.add(off + 3),
-            ]);
-            s.push_str(&format!("-{v}"));
-        }
-        Some(s)
-    }
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::core::PWSTR;
+
+    let mut raw = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(sid, &mut raw) }.ok()?;
+    let text = unsafe { raw.to_string() }.ok();
+    // ConvertSidToStringSidW 用 LocalAlloc 分配，必须由调用方释放
+    unsafe { LocalFree(Some(HLOCAL(raw.0 as *mut _))) };
+    text
 }

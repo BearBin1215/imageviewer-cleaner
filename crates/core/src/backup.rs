@@ -1,7 +1,7 @@
 //! ② 备份层 —— 隔离区与注册表导出
 //!
-//! 所有改动先落到隔离区，不直接删除。隔离区**必须与安装目录同卷**：
-//! 跨卷移动会退化成复制加删除，既不原子，也需要目标卷有等量空余空间。
+//! 所有改动先移入隔离区，不直接删除。隔离区与安装目录必须同卷：
+//! 跨卷移动会退化为复制加删除，既不原子，也要求目标卷有等量空余空间。
 //!
 //! 还原所需的全部信息记录在 `manifest.json` 里，还原时按它定位，不再推算。
 
@@ -10,30 +10,31 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::model::{Action, Manifest, RegItem};
 use crate::sys::SysContext;
+use crate::sys::wide;
 
 /// 隔离区根目录名（放在安装目录所在卷下）
 pub const QUARANTINE_DIR_NAME: &str = "imageviewer-cleaner";
 
 /// 一次清理操作对应的隔离区
 pub struct Quarantine {
+    /// 隔离区根目录，隐藏属性加在它上面
+    pub root: PathBuf,
     /// 本次操作的目录，如 `D:\imageviewer-cleaner\quarantine\20261011-132600`
     pub dir: PathBuf,
     pub install_dir: PathBuf,
 }
 
-/// 默认隔离区根目录：安装目录的**同级目录**下。
+/// 默认隔离区根目录：安装目录的同级目录下。
 ///
 /// 例如安装在 `D:\Program Files\BaiduNetdisk`，隔离区就在
 /// `D:\Program Files\imageviewer-cleaner\quarantine`。
-/// 必须与安装目录同卷（同卷移动才是原子改名），放在同级目录
-/// 既满足同卷要求，也不会在磁盘根目录下另起一个显眼的文件夹。
+/// 放在同级目录既满足同卷要求（同卷移动才是原子改名），
+/// 也避免在磁盘根目录下新建一个显眼的文件夹。
 pub fn default_root(install_dir: &Path) -> Result<PathBuf> {
-    let parent = install_dir.parent().ok_or_else(|| {
-        Error::io(install_dir, std::io::Error::other("安装目录没有上级目录"))
-    })?;
-    Ok(parent
-        .join(QUARANTINE_DIR_NAME)
-        .join("quarantine"))
+    let parent = install_dir
+        .parent()
+        .ok_or_else(|| Error::io(install_dir, std::io::Error::other("安装目录没有上级目录")))?;
+    Ok(parent.join(QUARANTINE_DIR_NAME).join("quarantine"))
 }
 
 /// 删除一份备份（用户确认网盘一切正常后释放空间用）
@@ -51,8 +52,23 @@ impl Quarantine {
     /// 在给定根目录下建一个带时间戳的隔离区（不落盘，首次写入时才创建目录）
     pub fn new(root: &Path, install_dir: &Path, stamp: &str) -> Self {
         Self {
+            root: root.to_path_buf(),
             dir: root.join(stamp),
             install_dir: install_dir.to_path_buf(),
+        }
+    }
+
+    /// 从已存在的隔离区目录构造（还原时用），根目录由该目录反推。
+    pub fn at(dir: impl Into<PathBuf>, install_dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let root = dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.clone());
+        Self {
+            root,
+            dir,
+            install_dir: install_dir.into(),
         }
     }
 
@@ -60,11 +76,9 @@ impl Quarantine {
         self.dir.join("files")
     }
 
-    /// 隔离区根目录加隐藏属性，避免用户误删或感觉突兀
+    /// 给隔离区根目录加隐藏属性，避免用户误删
     pub fn mark_hidden(&self, sys: &SysContext) {
-        if let Some(root) = self.dir.ancestors().nth(2) {
-            let _ = sys.fs.set_hidden(root);
-        }
+        let _ = sys.fs.set_hidden(&self.root);
     }
 
     pub fn registry_dir(&self) -> PathBuf {
@@ -93,7 +107,7 @@ impl Quarantine {
 
     /// 把某个注册表键导出为 `.reg` 文本
     ///
-    /// 导出整个键（而不是单个值），这样用户手工恢复时能看到完整上下文。
+    /// 导出整个键（含子键与全部值），用户手工恢复时能看到完整上下文。
     pub fn export(&self, sys: &SysContext, item: &RegItem) -> Result<PathBuf> {
         let out = self.registry_dir().join(reg_file_name(item));
         if let Some(parent) = out.parent() {
@@ -120,8 +134,8 @@ impl Quarantine {
 
 /// 操作日志：每记录一个动作就**原子落盘** `manifest.json`。
 ///
-/// 这保证即使清理中途进程被杀/断电，隔离区里也始终有一份与「已执行动作」一致的
-/// manifest，使这些改动可被还原——而不是变成无法识别、无法还原的孤儿文件。
+/// 这保证即使清理中途进程被杀或断电，隔离区里也始终有一份与已执行动作一致的
+/// manifest，这些改动因此都可被还原，不会变成无法识别、无法还原的残留文件。
 pub struct Journal {
     path: Option<PathBuf>,
     manifest: Manifest,
@@ -184,10 +198,6 @@ impl Journal {
             .map_err(|e| Error::data("manifest.json", e))?;
         atomic_write(path, json.as_bytes())
     }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 原子写：先写同目录临时文件，再用 `MoveFileExW(REPLACE_EXISTING)` 覆盖。

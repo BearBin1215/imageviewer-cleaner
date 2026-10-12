@@ -1,5 +1,5 @@
 {
-  "_comment": "严格精确匹配白名单。绝不用子串匹配 —— 实测 HKLM\\Software\\Classes 下存在 Baiduyunguanjia（百度云管家，另一个产品），子串匹配会误杀。",
+  "_comment": "严格精确匹配白名单。不要改成子串匹配 —— HKLM\\Software\\Classes 下存在 Baiduyunguanjia（百度云管家，另一个产品），子串匹配会误杀。",
   "match": "exact",
   "graceful_timeout_ms": 10000,
   "targets": [
@@ -11,6 +11,6 @@
     "BaiduNetdiskImageViewer.exe",
     "EntBaiduNetdiskImageViewer.exe"
   ],
-  "_comment_services": "M0b §4.5 实测：以上进程均不是 SCM 服务。服务分支仅作防御性保留（其他版本可能注册服务）。",
+  "_comment_services": "以上进程都不是 SCM 服务。服务分支为其他版本预留（某些版本可能注册服务）。",
   "check_services": true
 }

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::backup::{Journal, Quarantine};
 use crate::data::Tables;
+use crate::detect;
 use crate::error::{Error, Result};
 use crate::guard;
 use crate::model::{Action, ComponentId, RegItem};
@@ -19,14 +20,12 @@ use crate::sys::process::ProcessInfo;
 #[derive(Debug, Clone)]
 pub struct CleanOptions {
     pub graceful_timeout_ms: u64,
-    pub selected: Vec<ComponentId>,
 }
 
 impl CleanOptions {
-    pub fn from_tables(tables: &Tables, selected: Vec<ComponentId>) -> Self {
+    pub fn from_tables(tables: &Tables) -> Self {
         Self {
             graceful_timeout_ms: tables.processes.graceful_timeout_ms,
-            selected,
         }
     }
 }
@@ -244,6 +243,12 @@ pub fn move_files(
             if !sys.fs.exists(&target) {
                 continue;
             }
+            // 原位置已被占位物堵住说明该组件此前已清理过。搬走占位物没有意义：
+            // 加固层随后会在同一位置重建占位物，隔离区里只会多出一份无用的文件。
+            if detect::is_placeholder(sys, tables, install_dir, rel) {
+                rep.info(format!("{rel} 已被占位物堵住，跳过"));
+                continue;
+            }
             move_one(sys, q, journal, rel, rep)?;
         }
     }
@@ -278,11 +283,30 @@ pub fn refresh(sys: &SysContext) {
     sys.shell.notify_assoc_changed();
 }
 
-/// 校验主客户端仍然完整。任一关键文件缺失都返回错误，由编排层触发回滚。
+/// 收集清理开始前实际存在的必需文件，作为 [`verify`] 的基线。
 ///
-/// 判据清单来自 `data/paths.json` 的 `required_files`。
-pub fn verify(sys: &SysContext, tables: &Tables, install_dir: &Path) -> Result<()> {
-    for rel in &tables.paths.required_files {
+/// 清理前就缺失的必需文件不进基线：缺失源于版本差异或用户手动处理，
+/// 与本次清理无关；把它们也纳入校验会让这类机器上的任何清理都以回滚收场。
+/// 基线必须在任何改动发生之前收集。
+pub fn required_files_present(
+    sys: &SysContext,
+    tables: &Tables,
+    install_dir: &Path,
+) -> Vec<String> {
+    tables
+        .paths
+        .required_files
+        .iter()
+        .filter(|rel| sys.fs.exists(&install_dir.join(rel)))
+        .cloned()
+        .collect()
+}
+
+/// 校验基线中的必需文件全部仍然存在，任一缺失即返回错误，由编排层触发回滚。
+///
+/// 判据清单定义在 `data/paths.json` 的 `required_files`。
+pub fn verify(sys: &SysContext, install_dir: &Path, baseline: &[String]) -> Result<()> {
+    for rel in baseline {
         if !sys.fs.exists(&install_dir.join(rel)) {
             return Err(Error::ClientIntegrityBroken(rel.clone()));
         }
@@ -330,7 +354,6 @@ mod tests {
         let sys = sys_with(InMemoryRegistry::new(), proc);
         let opts = CleanOptions {
             graceful_timeout_ms: 0, // 不等待，直接进入强制终止
-            selected: vec![],
         };
         let mut j = journal();
         kill_processes(&sys, &tables, &opts, &mut j, &Reporter::silent()).unwrap();
@@ -454,6 +477,53 @@ mod tests {
     }
 
     #[test]
+    fn move_files_skips_paths_blocked_by_placeholder() {
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_clean_placeholder_skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 启动器位置已被占位目录堵住（上一次清理 + 加固的结果）
+        let launcher = dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe");
+        std::fs::create_dir_all(&launcher).unwrap();
+        // 旧版引擎本体仍在
+        std::fs::create_dir_all(dir.join(r"module\VastPlayer")).unwrap();
+        std::fs::write(dir.join(r"module\VastPlayer\vastplayer.dll"), b"vpold").unwrap();
+
+        let sys = sys_with(InMemoryRegistry::new(), FakeProcesses::new());
+        let q = Quarantine::new(&dir, &dir, "t");
+        let selected = vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy];
+        let mut j = journal();
+        move_files(
+            &sys,
+            &tables,
+            &dir,
+            &selected,
+            &q,
+            &mut j,
+            &Reporter::silent(),
+        )
+        .unwrap();
+
+        // 只应搬走旧版引擎本体；占位目录留在原地
+        assert_eq!(j.actions().len(), 1, "占位物不应被搬走");
+        match &j.actions()[0] {
+            Action::FileMoved { from, .. } => {
+                assert!(
+                    from.ends_with("vastplayer.dll"),
+                    "意外目标: {}",
+                    from.display()
+                );
+            }
+            other => panic!("意外动作: {other:?}"),
+        }
+        assert!(launcher.is_dir(), "占位目录必须留在原地");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(q.dir);
+    }
+
+    #[test]
     fn running_targets_filters_to_whitelist() {
         let tables = Tables::load().unwrap();
         let proc = FakeProcesses::new();
@@ -466,28 +536,39 @@ mod tests {
     }
 
     #[test]
-    fn verify_detects_missing_client_files() {
+    fn verify_only_holds_cleanup_accountable_for_existing_files() {
         let tables = Tables::load().unwrap();
         let dir = std::env::temp_dir().join("bc_clean_verify");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(r"module\BrowserEngine\resources")).unwrap();
 
         let sys = sys_with(InMemoryRegistry::new(), FakeProcesses::new());
-        // 什么都缺 → 必须报错
+
+        // 必需文件在清理开始前就全部缺失 → 基线为空，清理对它们不负责
+        let baseline = required_files_present(&sys, &tables, &dir);
+        assert!(baseline.is_empty());
+        assert!(verify(&sys, &dir, &baseline).is_ok());
+
+        // 文件齐全 → 全部进入基线，校验通过
+        for rel in &tables.paths.required_files {
+            std::fs::write(dir.join(rel), b"x").unwrap();
+        }
+        let baseline = required_files_present(&sys, &tables, &dir);
+        assert_eq!(baseline.len(), tables.paths.required_files.len());
+        assert!(verify(&sys, &dir, &baseline).is_ok());
+
+        // 清理弄丢了基线中的 vastplayer.dll → 必须报错：
+        // 它是实测确认的启动必需文件，缺失会让客户端反复启动失败
+        std::fs::remove_file(dir.join(r"module\BrowserEngine\vastplayer.dll")).unwrap();
         assert!(matches!(
-            verify(&sys, &tables, &dir),
-            Err(Error::ClientIntegrityBroken(_))
+            verify(&sys, &dir, &baseline),
+            Err(Error::ClientIntegrityBroken(rel)) if rel.ends_with("vastplayer.dll")
         ));
 
-        // 补齐关键文件 → 通过
-        std::fs::write(dir.join("BaiduNetdisk.exe"), b"x").unwrap();
-        std::fs::write(
-            dir.join(r"module\BrowserEngine\BaiduNetdiskUnite.exe"),
-            b"x",
-        )
-        .unwrap();
-        std::fs::write(dir.join(r"module\BrowserEngine\resources\app.asar"), b"x").unwrap();
-        assert!(verify(&sys, &tables, &dir).is_ok());
+        // 清理前就缺失的文件不进基线 → 它的缺失不触发回滚
+        let baseline = required_files_present(&sys, &tables, &dir);
+        assert!(!baseline.iter().any(|r| r.ends_with("vastplayer.dll")));
+        assert!(verify(&sys, &dir, &baseline).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

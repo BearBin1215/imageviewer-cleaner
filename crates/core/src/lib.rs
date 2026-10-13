@@ -27,8 +27,7 @@ pub mod sys;
 
 pub use error::{Error, Result};
 pub use model::{
-    Action, Component, ComponentId, ComponentKind, Detection, Manifest, PlaceholderKind, RegItem,
-    RegPath, RegRoot, Risk,
+    Action, Component, ComponentId, Detection, Manifest, PlaceholderKind, RegItem, RegPath, RegRoot,
 };
 pub use orchestrator::{CleanupConfig, run_cleanup, run_detect, run_restore};
 pub use progress::{Level, Progress, Reporter, Stage, Summary};

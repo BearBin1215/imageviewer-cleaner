@@ -18,7 +18,7 @@ use crate::sys::SysContext;
 /// 清理配置
 #[derive(Debug, Clone)]
 pub struct CleanupConfig {
-    /// 用户勾选的组件
+    /// 用户勾选的组件（各组件互相独立，见 `model::Component`）
     pub selected: Vec<ComponentId>,
     /// 是否建立占位物阻止重新部署。
     ///
@@ -114,14 +114,25 @@ fn mutate(
     journal: &mut Journal,
     rep: &Reporter,
 ) -> Result<()> {
+    // 基线在任何改动之前收集；收尾校验只对「清理前存在、清理后消失」的
+    // 必需文件报错
+    let baseline = clean::required_files_present(sys, tables, &d.install_dir);
+
     rep.stage(Stage::KillProcesses);
-    let opts = CleanOptions::from_tables(tables, cfg.selected.clone());
+    let opts = CleanOptions::from_tables(tables);
     clean::kill_processes(sys, tables, &opts, journal, rep)?;
 
     rep.stage(Stage::BreakAssoc);
-    let items = detect::existing_registry_items(sys, &d.registry_items);
-    rep.info(format!("待处理关联项 {} 条", items.len()));
-    clean::break_associations(sys, &items, q, journal, rep)?;
+    // 必须按勾选过滤：注册表项没有文件路径，不像文件组件那样能靠 selected 里的
+    // relative_paths 自然过滤，漏掉这一步会让「取消勾选文件关联」形同虚设。
+    // 关联项清单在探测阶段已按存在性过滤，直接使用。
+    if cfg.selected.contains(&ComponentId::RegistryAssoc) {
+        let items = &d.registry_items;
+        rep.info(format!("待处理关联项 {} 条", items.len()));
+        clean::break_associations(sys, items, q, journal, rep)?;
+    } else {
+        rep.info("未勾选文件关联，跳过");
+    }
 
     rep.stage(Stage::MoveFiles);
     clean::move_files(sys, tables, &d.install_dir, &cfg.selected, q, journal, rep)?;
@@ -130,7 +141,7 @@ fn mutate(
     rep.stage(Stage::Harden);
     if cfg.harden {
         let before = journal.actions().len();
-        harden::apply(sys, tables, &d.install_dir, journal)?;
+        harden::apply(sys, tables, &d.install_dir, &cfg.selected, journal)?;
         let n = journal.actions().len() - before;
         if n > 0 {
             rep.success(format!("已建立 {n} 个占位物，阻断重新部署"));
@@ -142,7 +153,7 @@ fn mutate(
     rep.stage(Stage::Refresh);
     clean::refresh(sys);
     rep.stage(Stage::Verify);
-    clean::verify(sys, tables, &d.install_dir)?;
+    clean::verify(sys, &d.install_dir, &baseline)?;
     rep.success("主客户端完整性校验通过");
     Ok(())
 }
@@ -224,10 +235,20 @@ pub fn run_detect(sys: &SysContext, tables: &Tables, rep: &Reporter) -> Result<D
 /// 定位安装目录，并列出该处可用的备份（最近的排在前面）。
 ///
 /// 界面用它刷新「还原 / 删除备份」可用的列表，无需自行拼装探测与备份逻辑。
+/// 旧版本把备份放在安装目录的同级目录，那里的存量备份也要继续列出。
 pub fn locate_backups(sys: &SysContext, tables: &Tables, sid: &str) -> Result<Vec<PathBuf>> {
     let install_dir = detect::locate_install_dir(sys, tables, sid)?;
-    let root = backup::default_root(&install_dir)?;
-    Ok(backup::list_backups(&root))
+    let mut list = backup::list_backups(&backup::default_root(&install_dir)?);
+    if let Some(old) = backup::legacy_root(&install_dir) {
+        for p in backup::list_backups(&old) {
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+        list.sort();
+        list.reverse();
+    }
+    Ok(list)
 }
 
 #[cfg(test)]
@@ -282,6 +303,18 @@ mod tests {
             b"asar",
         )
         .unwrap();
+        // 播放器引擎三件套的其余两项
+        std::fs::write(dir.join(r"module\BrowserEngine\vastplayer.dll"), b"vp").unwrap();
+        std::fs::write(
+            dir.join(r"module\BrowserEngine\resources\BaiduNetdiskPlayer.ico"),
+            b"ico",
+        )
+        .unwrap();
+        // 与播放器共用、必须原封不动的依赖
+        std::fs::write(dir.join(r"module\BrowserEngine\videoipc.dll"), b"ipc").unwrap();
+        std::fs::write(dir.join(r"module\BrowserEngine\localplayer.dll"), b"lp").unwrap();
+        std::fs::write(dir.join(r"module\VastPlayer\d3dx9_43.dll"), b"d3d").unwrap();
+        std::fs::write(dir.join(r"module\VastPlayer\vastplayer.dll"), b"vpold").unwrap();
 
         let reg = InMemoryRegistry::new();
         reg.set_user_hives(vec![SID.into()]);
@@ -305,16 +338,16 @@ mod tests {
         let qroot = std::env::temp_dir().join("bc_orch_quarantine");
         let _ = std::fs::remove_dir_all(&qroot);
 
-        // 显式启用加固，以便覆盖占位物的建立与还原
-        let cfg = CleanupConfig::new(vec![ComponentId::ImageViewer, ComponentId::PlayerLauncher])
+        // 显式启用加固，以便覆盖占位物的建立与还原；全选，覆盖所有组件
+        let cfg = CleanupConfig::new(ComponentId::ALL.to_vec())
             .with_harden(true)
             .with_quarantine_root(qroot.clone());
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
-        // 目录内容 2 项（入口程序 + 运行时 DLL）+ 启动器 1 项
-        assert_eq!(summary.files_moved, 3, "应移走全部目标");
-        // 只有一个文件型组件需要占位；目录本身保留，不需要占位
-        assert_eq!(summary.placeholders_created, 1);
+        // 看图目录内容 2 项 + 启动器 + 旧版引擎，全部组件都会被清理
+        assert_eq!(summary.files_moved, 4, "应移走全部目标");
+        // 两个文件型组件需要占位；目录本身保留，不需要占位
+        assert_eq!(summary.placeholders_created, 2);
         assert!(summary.registry_items_cleared > 0);
 
         // 目录本身必须还在，只是内容被清空
@@ -324,21 +357,29 @@ mod tests {
         );
         assert!(!dir.join(r"module\ImageViewer\Qt5Core.dll").exists());
 
-        // 组件已不在原位
+        // 组件已不在原位，原位置被占位物堵住
         assert!(
             !dir.join(r"module\ImageViewer\BaiduNetdiskImageViewer.exe")
                 .exists()
         );
+        assert!(
+            dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe")
+                .is_dir()
+        );
+        assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_dir());
+
         // 禁区文件原封不动
-        assert!(dir.join("BaiduNetdisk.exe").exists());
-        assert!(
-            dir.join(r"module\BrowserEngine\BaiduNetdiskUnite.exe")
-                .exists()
-        );
-        assert!(
-            dir.join(r"module\BrowserEngine\resources\app.asar")
-                .exists()
-        );
+        for keep in [
+            "BaiduNetdisk.exe",
+            r"module\BrowserEngine\BaiduNetdiskUnite.exe",
+            r"module\BrowserEngine\resources\app.asar",
+            r"module\BrowserEngine\vastplayer.dll",
+            r"module\BrowserEngine\localplayer.dll",
+            r"module\BrowserEngine\videoipc.dll",
+            r"module\VastPlayer\d3dx9_43.dll",
+        ] {
+            assert!(dir.join(keep).is_file(), "{keep} 不应被动到");
+        }
 
         // 找到隔离区并还原
         let qdir = std::fs::read_dir(&qroot)
@@ -357,11 +398,70 @@ mod tests {
         );
         assert!(
             dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe")
-                .is_file()
+                .is_file(),
+            "还原应把占位目录换回原文件"
         );
+        assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&qroot);
+    }
+
+    /// 必需文件在清理开始前就缺失（版本差异或用户手动处理）时，
+    /// 清理应当照常完成——缺失与本次清理无关，校验只对「从有到无」负责。
+    #[test]
+    fn cleanup_succeeds_when_required_file_already_missing() {
+        let (sys, dir) = fake_env("bc_orch_missing_required");
+        let tables = Tables::load().unwrap();
+        let qroot = std::env::temp_dir().join("bc_orch_missing_required_q");
+        let _ = std::fs::remove_dir_all(&qroot);
+
+        // 预先删掉一个必需文件，模拟非基线版本的安装现场
+        std::fs::remove_file(dir.join(r"module\BrowserEngine\vastplayer.dll")).unwrap();
+
+        let cfg =
+            CleanupConfig::new(vec![ComponentId::ImageViewer]).with_quarantine_root(qroot.clone());
+
+        let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
+        assert_eq!(summary.files_moved, 2, "看图目录内容应照常被清理");
         assert!(
-            dir.join(r"module\BrowserEngine\resources\video_player.asar")
-                .is_file()
+            !dir.join(r"module\ImageViewer\BaiduNetdiskImageViewer.exe")
+                .exists(),
+            "清理前就缺失的必需文件不应阻塞清理"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&qroot);
+    }
+
+    /// 任何一步失败时，已完成的动作必须全部回滚。
+    ///
+    /// 这里用「占位目标的父目录被同名文件占用」让加固阶段报错：
+    /// 此前旧版引擎已被移入隔离区，回滚后必须回到原位。
+    #[test]
+    fn cleanup_rolls_back_when_a_step_fails() {
+        let (sys, dir) = fake_env("bc_orch_rollback");
+        let tables = Tables::load().unwrap();
+        let qroot = std::env::temp_dir().join("bc_orch_rollback_q");
+        let _ = std::fs::remove_dir_all(&qroot);
+
+        // 把 module\BrowserEngine 换成同名文件：加固层无法在它下面创建占位目录
+        let _ = std::fs::remove_dir_all(dir.join(r"module\BrowserEngine"));
+        std::fs::write(dir.join(r"module\BrowserEngine"), b"x").unwrap();
+
+        let cfg = CleanupConfig::new(vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy])
+            .with_quarantine_root(qroot.clone());
+
+        let err = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap_err();
+        assert!(
+            !matches!(err, crate::error::Error::ClientIntegrityBroken(_)),
+            "失败应来自加固阶段，而非完整性校验，实际 {err:?}"
+        );
+
+        // 回滚之后旧版引擎应回到原位
+        assert!(
+            dir.join(r"module\VastPlayer\vastplayer.dll").is_file(),
+            "回滚后组件应已恢复"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -369,30 +469,38 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_aborts_and_rolls_back_when_client_file_missing() {
-        let (sys, dir) = fake_env("bc_orch_rollback");
+    fn unselected_components_are_left_untouched() {
+        let (sys, dir) = fake_env("bc_orch_partial");
         let tables = Tables::load().unwrap();
-        let qroot = std::env::temp_dir().join("bc_orch_rollback_q");
+        let qroot = std::env::temp_dir().join("bc_orch_partial_q");
         let _ = std::fs::remove_dir_all(&qroot);
 
-        // 故意删掉主客户端关键文件 → 校验必然失败
-        std::fs::remove_file(dir.join(r"module\BrowserEngine\BaiduNetdiskUnite.exe")).unwrap();
+        // 只勾播放器相关的两项：看图与文件关联都不勾
+        let cfg = CleanupConfig::new(vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy])
+            .with_harden(true)
+            .with_quarantine_root(qroot.clone());
 
-        let cfg =
-            CleanupConfig::new(vec![ComponentId::ImageViewer]).with_quarantine_root(qroot.clone());
-
-        let err = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap_err();
-        assert!(
-            matches!(err, crate::error::Error::ClientIntegrityBroken(_)),
-            "应因完整性校验失败而中断，实际 {err:?}"
+        let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
+        assert_eq!(summary.files_moved, 2, "只应动播放器启动器与旧版引擎");
+        assert_eq!(
+            summary.registry_items_cleared, 0,
+            "未勾选文件关联时不得清理任何关联项"
         );
+        assert_eq!(summary.placeholders_created, 2);
 
-        // 回滚之后组件应回到原位
+        // 看图原封不动，也没被占位物堵住
         assert!(
             dir.join(r"module\ImageViewer\BaiduNetdiskImageViewer.exe")
-                .is_file(),
-            "回滚后组件应已恢复"
+                .is_file()
         );
+        assert!(dir.join(r"module\ImageViewer\Qt5Core.dll").is_file());
+
+        // 播放器两项已被移走并占位
+        assert!(
+            dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe")
+                .is_dir()
+        );
+        assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_dir());
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&qroot);

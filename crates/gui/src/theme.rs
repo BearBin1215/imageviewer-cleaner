@@ -35,7 +35,6 @@ pub const TEXT_WEAK: Color32 = Color32::from_rgb(0x61, 0x61, 0x61);
 /// 成功 / 警告 / 危险
 pub const OK: Color32 = Color32::from_rgb(0x10, 0x7C, 0x10);
 pub const WARN: Color32 = Color32::from_rgb(0x9A, 0x62, 0x00);
-const WARN_BG: Color32 = Color32::from_rgb(0xFD, 0xF3, 0xE3);
 pub const DANGER: Color32 = Color32::from_rgb(0xA3, 0x2D, 0x2D);
 
 /// 图标方块的浅蓝底
@@ -268,17 +267,6 @@ pub fn weak(ui: &mut Ui, text: &str) -> Response {
 /// 主标题行（组件名 / 路径键名）
 pub fn strong(ui: &mut Ui, text: &str) -> Response {
     ui.label(RichText::new(text).size(13.5).color(TEXT))
-}
-
-/// 「谨慎」一类的风险徽章
-pub fn badge(ui: &mut Ui, text: &str) {
-    Frame::new()
-        .fill(WARN_BG)
-        .corner_radius(CornerRadius::same(9))
-        .inner_margin(Margin::symmetric(9, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).color(WARN));
-        });
 }
 
 // ───────────────────────────── 按钮 ─────────────────────────────

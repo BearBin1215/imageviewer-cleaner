@@ -2,6 +2,8 @@
 
 移除 Windows 百度网盘客户端捆绑的智能看图与智能播放器，恢复它们占用的文件关联。
 
+当前对应度盘基线版本：`8.8.8.101`。
+
 ## 使用
 
 从 [releases](https://github.com/BearBin1215/imageviewer-cleaner/releases) 下载后直接运行，无需安装。支持备份、还原。

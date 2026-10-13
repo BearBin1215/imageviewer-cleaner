@@ -22,6 +22,8 @@ pub struct MoveOutcome {
 pub trait FsBackend: Send + Sync {
     fn exists(&self, p: &Path) -> bool;
     fn is_dir(&self, p: &Path) -> bool;
+    /// 目录存在且没有任何条目（探测「清空目录内容」型组件是否已清理用）
+    fn is_empty_dir(&self, p: &Path) -> bool;
     /// 文件大小或目录递归大小
     fn size_of(&self, p: &Path) -> Result<u64>;
     /// 路径所在卷的可用空间
@@ -90,6 +92,12 @@ impl FsBackend for Win32Fs {
 
     fn is_dir(&self, p: &Path) -> bool {
         p.is_dir()
+    }
+
+    fn is_empty_dir(&self, p: &Path) -> bool {
+        std::fs::read_dir(p)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
     }
 
     fn size_of(&self, p: &Path) -> Result<u64> {

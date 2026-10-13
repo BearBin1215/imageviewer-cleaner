@@ -1,13 +1,13 @@
 {
-  "_comment": "候选安装路径（兜底用）。首选是进程镜像路径反查，次选是注册表 InstallDir（该键在部分机器上不存在）。",
+  "_comment": "候选安装路径（兜底用）。首选是进程镜像路径反查，次选是注册表 InstallDir（该键在部分机器上不存在）。顺序即优先级：多个候选同时含 marker 文件时取最前面那个；用户目录（%APPDATA% / %LOCALAPPDATA%）刻意排在 Program Files 之前——同时存在用户级与系统级安装的机器上优先选中用户级。",
   "marker": "BaiduNetdisk.exe",
   "candidates": [
+    "%APPDATA%\\baidu\\BaiduNetdisk",
+    "%LOCALAPPDATA%\\Baidu\\BaiduNetdisk",
     "%ProgramFiles%\\Baidu\\BaiduNetdisk",
     "%ProgramFiles(x86)%\\Baidu\\BaiduNetdisk",
     "%ProgramFiles%\\BaiduNetdisk",
     "%ProgramFiles(x86)%\\BaiduNetdisk",
-    "%APPDATA%\\baidu\\BaiduNetdisk",
-    "%LOCALAPPDATA%\\Baidu\\BaiduNetdisk",
     "C:\\BaiduNetdisk",
     "D:\\BaiduNetdisk",
     "D:\\Program Files\\BaiduNetdisk",
@@ -19,15 +19,18 @@
     "value": "InstallDir"
   },
 
-  "_comment_required": "主客户端完整性判据：清理结束后这些文件必须仍然存在，任一缺失即视为破坏了客户端，立即回滚。",
+  "_comment_required": "主客户端完整性判据：清理开始前存在的文件，清理结束后必须仍然存在；从有到无即视为清理破坏了客户端，立即回滚。清理前就缺失的文件不参与校验（版本差异或用户手动处理所致，与本次清理无关）。vastplayer.dll 与 video_player.asar 是实测确认的启动必需项——客户端启动时会无条件拉起 plugin_id=3 的插件宿主加载 vastplayer.dll，并核对 resources 下的 asar 包。",
   "required_files": [
     "BaiduNetdisk.exe",
     "module\\BrowserEngine\\BaiduNetdiskUnite.exe",
-    "module\\BrowserEngine\\resources\\app.asar"
+    "module\\BrowserEngine\\resources\\app.asar",
+    "module\\BrowserEngine\\resources\\video_player.asar",
+    "module\\BrowserEngine\\vastplayer.dll"
   ],
 
-  "_comment_placeholder": "占位目标：组件被清理后，在原位置放置相反类型的同名对象（原本是文件的位置放目录），阻断客户端重建。",
+  "_comment_placeholder": "占位目标：组件被清理后，在原位置放置相反类型的同名对象（原本是文件的位置放目录），阻断客户端重建。占位对象路径见 data.rs 的 PlaceholderTarget::relative_path；只列实测确认「移除后客户端仍能正常启动」的组件。",
   "placeholder_targets": [
-    { "component": "PlayerLauncher", "kind": "dir_instead_of_file" }
+    { "component": "PlayerLauncher", "kind": "dir_instead_of_file" },
+    { "component": "PlayerLegacy", "kind": "dir_instead_of_file" }
   ]
 }

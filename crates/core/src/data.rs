@@ -29,6 +29,22 @@ pub struct PlaceholderTarget {
     pub kind: PlaceholderKind,
 }
 
+impl PlaceholderTarget {
+    /// 占位对象的相对路径（取该组件 `relative_paths()` 的第一项，全项目唯一出处）
+    pub fn relative_path(&self) -> Option<&'static str> {
+        self.component.relative_paths().first().copied()
+    }
+}
+
+impl PathsTable {
+    /// 某个相对路径是否为占位目标；占位对象路径见 [`PlaceholderTarget::relative_path`]。
+    pub fn placeholder_kind_for(&self, relative: &str) -> Option<PlaceholderKind> {
+        self.placeholder_targets
+            .iter()
+            .find_map(|t| (t.relative_path() == Some(relative)).then_some(t.kind))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistryValueRef {
     pub sub: String,
@@ -92,7 +108,6 @@ impl ProcessesTable {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForbiddenTable {
     pub relative_paths: Vec<String>,
-    pub shared_dir_exceptions: Vec<String>,
 }
 
 pub struct Tables {
@@ -263,5 +278,22 @@ mod tests {
         assert!(!t.processes.is_target("BaiduYunGuanjia.exe"));
         assert!(!t.processes.is_target("MyBaiduHelper.exe"));
         assert!(!t.processes.is_target("yun.exe"));
+    }
+
+    /// 候选顺序即兜底扫描的优先级：多个候选同时含 marker 文件时取最前面的。
+    /// 用户目录候选刻意排在 Program Files 之前——同时存在用户级与系统级安装时
+    /// 优先选中用户级。调整顺序会改变这类机器上选中的安装目录，须有意为之。
+    #[test]
+    fn candidate_order_prioritizes_user_level_installs() {
+        let t = Tables::load().unwrap();
+        assert!(
+            t.paths
+                .candidates
+                .iter()
+                .take(2)
+                .all(|c| c.contains("APPDATA")),
+            "前两条应是用户目录候选，实际 {:?}",
+            &t.paths.candidates[..2]
+        );
     }
 }

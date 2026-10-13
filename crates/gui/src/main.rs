@@ -24,7 +24,8 @@ use egui::{Margin, RichText, Vec2};
 use imageviewer_cleaner_core::backup;
 use imageviewer_cleaner_core::clean;
 use imageviewer_cleaner_core::data::Tables;
-use imageviewer_cleaner_core::model::{ComponentId, Detection, Risk};
+use imageviewer_cleaner_core::detect;
+use imageviewer_cleaner_core::model::{ComponentId, Detection};
 use imageviewer_cleaner_core::orchestrator::{self, CleanupConfig};
 use imageviewer_cleaner_core::progress::{Level, Progress, Reporter, Summary};
 use imageviewer_cleaner_core::sys::SysContext;
@@ -52,8 +53,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 680.0])
-            .with_min_inner_size([600.0, 520.0]),
+            .with_inner_size([640.0, 680.0])
+            .with_min_inner_size([600.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -137,7 +138,6 @@ struct App {
 
     pending_scan: bool,
     detection: Option<Detection>,
-    error: Option<String>,
     log: Vec<(Level, String)>,
     checks: BTreeMap<ComponentId, bool>,
 
@@ -164,7 +164,6 @@ impl App {
             precheck_rx: None,
             pending_scan: true,
             detection: None,
-            error: None,
             log: Vec::new(),
             checks: BTreeMap::new(),
             confirm_cleanup: false,
@@ -180,6 +179,7 @@ impl App {
         self.rx.is_some()
     }
 
+    /// 用户勾选、且当前确实存在的组件（各组件互相独立，见 `model::Component`）。
     fn selected(&self) -> Vec<ComponentId> {
         let Some(d) = &self.detection else {
             return Vec::new();
@@ -195,7 +195,6 @@ impl App {
         self.log.clear();
         self.checks.clear();
         self.detection = None;
-        self.error = None;
     }
 
     /// 在 worker 线程里跑探测
@@ -203,7 +202,6 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.task = Some(Task::Scan);
-        self.error = None;
 
         let wake = ctx.clone();
         thread::spawn(move || {
@@ -227,7 +225,6 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.task = Some(Task::Clean);
-        self.error = None;
 
         let wake = ctx.clone();
         thread::spawn(move || {
@@ -247,14 +244,19 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.task = Some(Task::DeleteBackup);
-        self.error = None;
 
         let wake = ctx.clone();
         thread::spawn(move || {
             let rep = Reporter::new(tx, Box::new(move || wake.request_repaint()));
+            let sys = SysContext::win32();
+            let bytes = sys.fs.size_of(&dir).unwrap_or(0);
             match backup::delete_backup(&dir) {
                 Ok(()) => {
-                    rep.success(format!("备份已删除：{}", dir.display()));
+                    rep.success(format!(
+                        "备份已删除：{}（释放 {}）",
+                        dir.display(),
+                        detect::fmt_size(bytes)
+                    ));
                     rep.emit(Progress::Finished(Ok(Summary::default())));
                 }
                 Err(e) => rep.emit(Progress::Finished(Err(e))),
@@ -267,7 +269,6 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.task = Some(Task::Restore);
-        self.error = None;
 
         let wake = ctx.clone();
         thread::spawn(move || {
@@ -339,7 +340,6 @@ impl App {
                 Progress::Stage(s) => self.log.push((Level::Info, s.label().to_owned())),
                 Progress::Log { level, text } => self.log.push((level, text)),
                 Progress::Finished(Err(e)) => {
-                    self.error = Some(e.to_string());
                     self.log.push((Level::Error, e.to_string()));
                     finished = true;
                 }
@@ -363,7 +363,8 @@ impl App {
                         }
                         self.log.push((
                             Level::Info,
-                            "请现在启动百度网盘，确认它能正常使用。确认无误后可删除备份释放空间。"
+                            "请现在启动百度网盘，确认它能正常使用。\
+                             若反复启动失败或弹出兼容模式窗口，请立即用「还原」恢复。"
                                 .to_owned(),
                         ));
                         // 隔离区目录随汇总返回，无需再扫描一遍备份
@@ -525,54 +526,63 @@ impl eframe::App for App {
                 ui.add_space(6.0);
 
                 // ── 组件清单 ──
-                // 不套滚动区：条目数量固定，把富余高度留给日志区
+                // 条目数量固定，限高滚动，避免把日志区挤没。
+                // 上限 320 大于全部条目的自然高度，窗口最小高度 680 也保证了
+                // 这里的内容完整显示——勾选前要看清全部组件，不能靠滚动隐藏。
+                // 勾选决定清理范围，组件之间互相独立。
                 theme::section(ui, "清理项目");
                 match &self.detection {
                     Some(d) if !d.components.is_empty() => {
-                        theme::card(ui, |ui| {
-                            for (i, c) in d.components.iter().enumerate() {
-                                if i > 0 {
-                                    theme::divider(ui);
-                                }
-                                let present = c.present();
-                                let on = !busy && present;
-                                let mut v =
-                                    present && self.checks.get(&c.id).copied().unwrap_or(false);
-
-                                theme::row(ui, 12, |ui| {
-                                    ui.horizontal(|ui| {
-                                        theme::checkbox(ui, &mut v, on);
-                                        ui.add_space(11.0);
-                                        if present {
-                                            theme::strong(ui, &c.label);
-                                            // 详情右对齐到卡片内缘；有风险徽章时，
-                                            // 徽章作为后缀留在更右侧
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.spacing_mut().item_spacing.x = 8.0;
-                                                    if c.risk == Risk::Caution {
-                                                        theme::badge(ui, "谨慎");
-                                                    }
-                                                    theme::weak(ui, &c.detail);
-                                                },
-                                            );
-                                        } else {
-                                            // 已清理的条目保留在原位，避免列表突然变短让人以为出错
-                                            theme::weak(ui, &c.label);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| theme::weak(ui, "已清理"),
-                                            );
+                        egui::ScrollArea::vertical()
+                            .id_salt("components")
+                            .max_height(320.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                theme::card(ui, |ui| {
+                                    for (i, c) in d.components.iter().enumerate() {
+                                        if i > 0 {
+                                            theme::divider(ui);
                                         }
-                                    });
-                                });
+                                        let present = c.present();
+                                        let on = !busy && present;
+                                        let mut v = present
+                                            && self.checks.get(&c.id).copied().unwrap_or(false);
 
-                                if present {
-                                    self.checks.insert(c.id, v);
-                                }
-                            }
-                        });
+                                        theme::row(ui, 12, |ui| {
+                                            ui.horizontal(|ui| {
+                                                theme::checkbox(ui, &mut v, on);
+                                                ui.add_space(11.0);
+                                                if present {
+                                                    theme::strong(ui, &c.label);
+                                                    // 详情右对齐到卡片内缘
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                                            theme::weak(ui, &c.detail);
+                                                        },
+                                                    );
+                                                } else {
+                                                    // 已清理的条目保留在原位，避免列表突然变短让人以为出错
+                                                    theme::weak(ui, &c.label);
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| theme::weak(ui, "已清理"),
+                                                    );
+                                                }
+                                            });
+                                        });
+
+                                        if present {
+                                            self.checks.insert(c.id, v);
+                                        }
+                                    }
+                                });
+                            });
                     }
                     Some(_) => {
                         theme::weak(ui, "未发现可清理的组件。");
@@ -598,16 +608,11 @@ impl eframe::App for App {
                             .response
                             .on_hover_text(
                                 "不影响网盘正常启动，默认开启；\n\
-                                 若个别环境异常，可取消勾选，或清理后用「还原」恢复。",
+                                 若个别环境异常，可关闭本开关，或清理后用「还原」恢复。",
                             );
                         });
                     });
                 });
-
-                if let Some(e) = &self.error {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(e).size(12.5).color(theme::DANGER));
-                }
 
                 ui.add_space(6.0);
 
@@ -655,8 +660,14 @@ impl eframe::App for App {
                             .size(13.0)
                             .color(theme::TEXT),
                     );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("若网盘反复启动失败、或弹出兼容模式窗口，请立即点「还原」。")
+                            .size(12.5)
+                            .color(theme::WARN),
+                    );
                     ui.add_space(4.0);
-                    theme::weak(ui, "确认无误后可删除备份释放空间。");
+                    theme::weak(ui, "确认网盘能正常启动之后，再删除备份释放空间。");
                     dialog_footer(ui, |ui| {
                         if theme::primary_button(ui, "稍后再说").clicked() {
                             dismiss = true;
@@ -726,6 +737,7 @@ impl eframe::App for App {
                             theme::weak(ui, &format!("   {}", c.detail));
                         }
                     }
+
                     ui.add_space(12.0);
                     theme::weak(ui, "清理期间请不要关闭窗口。");
 
@@ -772,6 +784,16 @@ impl eframe::App for App {
                             .size(12.5)
                             .color(theme::DANGER),
                     );
+                    if backups.len() > 1 {
+                        ui.add_space(6.0);
+                        theme::weak(
+                            ui,
+                            &format!(
+                                "共有 {} 份备份，本次只删除这一份，其余保留。",
+                                backups.len()
+                            ),
+                        );
+                    }
                     dialog_footer(ui, |ui| {
                         if theme::danger_button(ui, "删除").clicked() {
                             go = true;

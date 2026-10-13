@@ -3,47 +3,100 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// 清理目标组件
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 勾选状态独立保存：看图与播放器是两件独立的事，用户可以只清其中一样。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Component {
     pub id: ComponentId,
     /// 界面展示名，如「智能看图」
     pub label: String,
-    /// 副标题，如「（388 MB）」
+    /// 副标题：文件组件是大小，注册表组件是命中的关联项数
     pub detail: String,
-    pub kind: ComponentKind,
-    pub risk: Risk,
+    /// 默认是否勾选。用户可以在界面上改，因此组件之间互相独立。
     pub default_enabled: bool,
-    pub size_bytes: Option<u64>,
-    /// 实际存在的路径。为空表示该组件当前不存在（已清理或未安装）。
-    pub paths: Vec<PathBuf>,
+    /// 实际探测到的目标数量，是「该组件是否还存在」的唯一判据。
+    ///
+    /// 文件/目录组件等于实际存在的路径数；注册表组件没有路径，等于实际命中的
+    /// 关联项数。候选清单只按数据表展开，数量固定不变，不能当作探测结果。
+    pub found: usize,
 }
 
 impl Component {
-    /// 该组件当前是否存在。
-    /// 注册表关联没有具体路径，其存在与否由探测阶段单独判定，这里恒为存在。
+    /// 该组件当前是否还存在。
     pub fn present(&self) -> bool {
-        self.kind == ComponentKind::Registry || !self.paths.is_empty()
+        self.found > 0
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum ComponentId {
-    /// 智能看图（默认勾选）。
-    /// 只清空 `module\ImageViewer` 的内容并保留目录本身：
-    /// 整目录移走会让客户端检测到模块缺失而无法启动，
-    /// 清空内容（含入口程序）则不影响客户端启动。
-    ImageViewer,
-    /// 播放器启动器（默认勾选）
-    PlayerLauncher,
-    /// 注册表关联（默认勾选）
-    RegistryAssoc,
+/// 从同一份变体列表定义 [`ComponentId`] 枚举与 `ALL` 清单。
+///
+/// 枚举与清单共享同一份 token 流，不存在「枚举里有、清单里漏」的失同步：
+/// 新增变体时 `ALL` 自动包含它。
+macro_rules! define_component_id {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        pub enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )*
+        }
+
+        impl $name {
+            /// 全部组件。进入枚举就会出现在界面的可勾选清单里；
+            /// 默认勾选状态由 [`Self::default_enabled`] 决定。
+            ///
+            /// 本清单与枚举由 [`define_component_id!`] 从同一份变体列表生成，
+            /// 不需要也无法单独登记。
+            pub const ALL: [Self; define_component_id!(@count $($variant)*)] =
+                [$(Self::$variant),*];
+        }
+    };
+
+    (@count $head:ident $($tail:ident)*) => { 1 + define_component_id!(@count $($tail)*) };
+    (@count) => { 0 };
+}
+
+define_component_id! {
+    /// 清理目标组件的唯一标识
+    pub enum ComponentId {
+        /// 智能看图。
+        /// 只清空 `module\ImageViewer` 的内容并保留目录本身：
+        /// 整目录移走会让客户端检测到模块缺失而无法启动，
+        /// 清空内容（含入口程序）则不影响客户端启动。
+        ImageViewer,
+        /// 播放器启动器。
+        /// 它是文件关联的处理程序入口。实测确认：移除它之后客户端仍能正常启动。
+        PlayerLauncher,
+        /// 旧版播放器引擎。
+        ///
+        /// `module\VastPlayer\vastplayer.dll` 是旧构建，运行中的宿主加载的是
+        /// BrowserEngine 下的同名文件（实测基线 8.8.8.101 中二者分别为
+        /// 2.2.4.10 与 2.2.4.14），它不在 `browserengine.dll` 的启动校验清单里。
+        /// 实测确认：移除后客户端能正常启动并播放视频。
+        ///
+        /// 只点名这一个文件——同目录的 `d3dx9_43.dll` 正被插件宿主加载，必须留下。
+        PlayerLegacy,
+        /// 注册表关联
+        RegistryAssoc,
+    }
 }
 
 impl ComponentId {
     pub fn label(self) -> &'static str {
         match self {
             Self::ImageViewer => "智能看图",
-            Self::PlayerLauncher => "智能播放器",
+            Self::PlayerLauncher => "播放器启动器",
+            Self::PlayerLegacy => "播放器旧版引擎",
             Self::RegistryAssoc => "文件关联",
         }
     }
@@ -53,43 +106,28 @@ impl ComponentId {
         matches!(self, Self::ImageViewer)
     }
 
+    /// 该组件要清理的相对路径。注册表组件没有文件路径，返回空。
     pub fn relative_paths(self) -> &'static [&'static str] {
         match self {
             Self::ImageViewer => &[r"module\ImageViewer"],
             Self::PlayerLauncher => &[r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe"],
+            Self::PlayerLegacy => &[r"module\VastPlayer\vastplayer.dll"],
             Self::RegistryAssoc => &[],
         }
     }
 
-    /// 默认的风险等级与勾选状态。
+    /// 默认是否勾选。
     ///
-    /// 这里刻意穷尽匹配全部变体：新增组件时编译器会要求显式决定它的风险等级
-    /// 与默认勾选状态，避免新组件被默认勾选而误删用户数据。
-    pub fn default_risk(self) -> (Risk, bool) {
+    /// 这里刻意穷尽匹配全部变体：新增组件时若未显式登记默认勾选状态，编译会
+    /// 失败，避免新组件在无人确认的情况下被默认勾选。当前全部默认勾选——它们
+    /// 都是运行本工具就想清掉的东西；但清单本身是可选的，用户可以只清其中一部分。
+    pub fn default_enabled(self) -> bool {
         match self {
-            Self::ImageViewer | Self::PlayerLauncher | Self::RegistryAssoc => (Risk::Safe, true),
+            Self::ImageViewer | Self::PlayerLauncher | Self::PlayerLegacy | Self::RegistryAssoc => {
+                true
+            }
         }
     }
-
-    pub const ALL: [Self; 3] = [Self::ImageViewer, Self::PlayerLauncher, Self::RegistryAssoc];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ComponentKind {
-    Directory,
-    File,
-    Registry,
-}
-
-/// 风险等级 —— 决定 UI 是否允许勾选
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Risk {
-    /// 默认勾选
-    Safe,
-    /// 默认不勾选，需用户显式确认
-    Caution,
-    /// 永远不可操作（禁区清单来自 `data/forbidden.json`）
-    Forbidden,
 }
 
 /// 探测结果
@@ -99,7 +137,8 @@ pub struct Detection {
     pub target_user_sid: String,
     pub install_dir: PathBuf,
     pub components: Vec<Component>,
-    /// 实际存在的注册表关联项（用于展示与清理）
+    /// 实际存在的注册表关联项，供展示与清理使用。
+    /// 探测阶段已按存在性过滤，候选清单中不存在的项不在其中。
     pub registry_items: Vec<RegItem>,
 }
 
@@ -239,4 +278,47 @@ pub enum PlaceholderKind {
     FileInsteadOfDir,
     /// 文件 → 同名目录
     DirInsteadOfFile,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 组件清单是界面上「可勾选的项目」清单。
+    ///
+    /// 新增组件时必须更新本断言，确认新目标确实可以清理：它通过了禁区校验与
+    /// 启动必需文件校验，默认勾选状态也在 [`ComponentId::default_enabled`] 里
+    /// 显式登记。
+    #[test]
+    fn component_set_is_deliberate() {
+        assert_eq!(
+            ComponentId::ALL.len(),
+            4,
+            "组件数量变了：新增组件会出现在可勾选清单里，请确认新目标确实可清，再更新本断言"
+        );
+    }
+
+    /// `ALL` 与枚举由 [`define_component_id!`] 从同一份变体列表生成，
+    /// 不会失同步；这里核对每个变体都有展示名。
+    #[test]
+    fn all_lists_every_variant() {
+        for id in ComponentId::ALL {
+            assert!(!id.label().is_empty(), "{id:?} 缺少展示名");
+        }
+    }
+
+    /// `present()` 只看 `found`。
+    #[test]
+    fn present_follows_found() {
+        let c = Component {
+            id: ComponentId::RegistryAssoc,
+            label: "t".into(),
+            detail: "t".into(),
+            default_enabled: true,
+            found: 0,
+        };
+        assert!(!c.present());
+        let c = Component { found: 3, ..c };
+        assert!(c.present());
+    }
 }

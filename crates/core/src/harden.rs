@@ -11,21 +11,29 @@ use std::path::Path;
 use crate::backup::Journal;
 use crate::data::Tables;
 use crate::error::Result;
-use crate::model::{Action, PlaceholderKind};
+use crate::model::{Action, ComponentId, PlaceholderKind};
 use crate::sys::SysContext;
 
 /// 建立占位物。目标仍存在时跳过，避免破坏现场。
 ///
-/// 占位清单来自 `data/paths.json` 的 `placeholder_targets`。关键目标是堵住
-/// 播放器启动器：没有它，播放器即使代码包被重新下载也无法被调用。
+/// 占位清单来自 `data/paths.json` 的 `placeholder_targets`，占位对象路径见
+/// [`crate::data::PlaceholderTarget::relative_path`]。关键目标是堵住播放器启动器
+/// 与旧版引擎：没有它们，播放器即使代码包被重新下载也无法被调用。
+///
+/// 只处理 `selected` 里的组件：未勾选的组件即使文件已缺失也不得占位，
+/// 否则「保留这个组件」的意愿会被加固逻辑覆盖。
 pub fn apply(
     sys: &SysContext,
     tables: &Tables,
     install_dir: &Path,
+    selected: &[ComponentId],
     journal: &mut Journal,
 ) -> Result<()> {
     for target in &tables.paths.placeholder_targets {
-        let Some(rel) = target.component.relative_paths().first().copied() else {
+        if !selected.contains(&target.component) {
+            continue;
+        }
+        let Some(rel) = target.relative_path() else {
             continue;
         };
         let path = install_dir.join(rel);
@@ -73,11 +81,28 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_covers_only_player_launcher() {
+    fn placeholder_targets_cover_only_verified_components() {
         let tables = Tables::load().unwrap();
         let targets = &tables.paths.placeholder_targets;
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].component, ComponentId::PlayerLauncher);
+        let ids: Vec<ComponentId> = targets.iter().map(|t| t.component).collect();
+        assert_eq!(
+            ids,
+            vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy],
+            "占位目标应只覆盖实测确认可移除的组件"
+        );
+
+        for t in targets {
+            assert!(
+                !t.component.relative_paths().is_empty(),
+                "{:?} 没有相对路径，无法占位",
+                t.component
+            );
+            assert!(
+                !t.component.moves_dir_contents(),
+                "{:?} 是「清空目录内容」型组件，目录本身要保留，不该整目录占位",
+                t.component
+            );
+        }
     }
 
     #[test]
@@ -88,19 +113,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
+        let selected = vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy];
         let mut j = journal();
-        apply(&sys, &tables, &dir, &mut j).unwrap();
+        apply(&sys, &tables, &dir, &selected, &mut j).unwrap();
         let actions: Vec<Action> = j.actions().to_vec();
-        assert_eq!(actions.len(), 1, "启动器是唯一的占位目标");
+        assert_eq!(actions.len(), 2, "启动器与旧版引擎各占一个位");
 
-        // 文件位置放的是目录
+        // 文件位置放的都是目录
         let launcher = dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe");
         assert!(launcher.is_dir(), "启动器位置应是目录");
+        let legacy = dir.join(r"module\VastPlayer\vastplayer.dll");
+        assert!(legacy.is_dir(), "旧版引擎位置应是目录");
 
         // 再跑一次应幂等（目标已存在则跳过）
         let mut j2 = journal();
-        apply(&sys, &tables, &dir, &mut j2).unwrap();
+        apply(&sys, &tables, &dir, &selected, &mut j2).unwrap();
         assert!(j2.actions().is_empty(), "已存在占位物时不应重复创建");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_skips_targets_that_still_exist() {
+        let sys = ctx();
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_harden_existing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(r"module\BrowserEngine")).unwrap();
+
+        // 启动器还在原位 → 不得被占位物覆盖，避免破坏现场
+        let launcher = dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe");
+        std::fs::write(&launcher, b"launch").unwrap();
+
+        let selected = vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy];
+        let mut j = journal();
+        apply(&sys, &tables, &dir, &selected, &mut j).unwrap();
+        assert!(launcher.is_file(), "仍存在的目标不得被占位物覆盖");
+        // 只有缺了的旧版引擎会被占位
+        assert_eq!(j.actions().len(), 1);
+        assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_dir());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用户取消勾选的组件，原位置即使已缺失也不得占位。
+    ///
+    /// 否则「只清播放器、保留看图」这类意愿会被加固逻辑覆盖掉。
+    #[test]
+    fn apply_skips_components_not_selected() {
+        let sys = ctx();
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_harden_unselected");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 只勾了看图：两个占位目标都必须跳过
+        let selected = vec![ComponentId::ImageViewer];
+        let mut j = journal();
+        apply(&sys, &tables, &dir, &selected, &mut j).unwrap();
+        assert!(j.actions().is_empty(), "未勾选的组件不得占位");
+        assert!(
+            !dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe")
+                .exists(),
+            "未勾选组件的原位置不得被占用"
+        );
+        assert!(
+            !dir.join(r"module\VastPlayer\vastplayer.dll").exists(),
+            "未勾选组件的原位置不得被占用"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

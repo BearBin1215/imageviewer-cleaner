@@ -27,7 +27,7 @@ pub enum Error {
         source: windows::core::Error,
     },
 
-    #[error("主客户端完整性校验失败，缺失: {0}")]
+    #[error("主客户端完整性校验失败：{0} 缺失。该文件是客户端启动必需项，清理已中止并回滚")]
     ClientIntegrityBroken(String),
 
     #[error("数据表解析失败 [{name}]: {source}")]

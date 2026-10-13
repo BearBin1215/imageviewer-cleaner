@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::data::Tables;
 use crate::error::{Error, Result};
-use crate::model::{Component, ComponentId, ComponentKind, Detection, RegItem};
+use crate::model::{Component, ComponentId, Detection, PlaceholderKind, RegItem};
 use crate::sys::SysContext;
 
 pub fn detect(sys: &SysContext, tables: &Tables) -> Result<Detection> {
@@ -22,8 +22,11 @@ pub fn detect(sys: &SysContext, tables: &Tables) -> Result<Detection> {
         return Err(Error::InstallNotFound);
     }
 
-    let components = scan_components(sys, tables, &install_dir);
-    let registry_items = scan_registry(tables, &target_user_sid);
+    // 关联项在探测阶段按存在性过滤一次，结果存入 Detection；
+    // 展示与清理直接复用，不再各自重查一遍注册表
+    let candidates = scan_registry(tables, &target_user_sid);
+    let registry_items = existing_registry_items(sys, &candidates);
+    let components = scan_components(sys, tables, &install_dir, &registry_items);
 
     Ok(Detection {
         target_user_sid,
@@ -112,23 +115,26 @@ pub fn expand_env(s: &str) -> String {
 
 // ───────────────────────────── 组件扫描 ─────────────────────────────
 
-pub fn scan_components(sys: &SysContext, tables: &Tables, install_dir: &Path) -> Vec<Component> {
+/// 扫描组件清单。
+///
+/// `registry_items` 是探测阶段实际命中的关联项：注册表组件没有文件路径，
+/// 它的存在与否和数量都由这份清单表达。
+pub fn scan_components(
+    sys: &SysContext,
+    tables: &Tables,
+    install_dir: &Path,
+    registry_items: &[RegItem],
+) -> Vec<Component> {
     let mut out = Vec::new();
 
     for id in ComponentId::ALL {
-        let (risk, default_enabled) = id.default_risk();
-
         if id == ComponentId::RegistryAssoc {
             out.push(Component {
                 id,
                 label: id.label().to_owned(),
-                detail: format!("约 {} 个扩展名", tables.extensions.count()),
-                kind: ComponentKind::Registry,
-                risk,
-                default_enabled,
-                size_bytes: None,
-                // 注册表项的「存在与否」在探测阶段单独判定，这里不涉及具体路径
-                paths: Vec::new(),
+                detail: format!("已发现 {} 项", registry_items.len()),
+                default_enabled: id.default_enabled(),
+                found: registry_items.len(),
             });
             continue;
         }
@@ -139,42 +145,66 @@ pub fn scan_components(sys: &SysContext, tables: &Tables, install_dir: &Path) ->
         let mut size = 0u64;
         for rel in id.relative_paths() {
             let full = install_dir.join(rel);
-            if sys.fs.exists(&full) {
-                size += sys.fs.size_of(&full).unwrap_or(0);
-                paths.push(full);
+            // 占位物不是组件本体。把它算作「存在」会让界面把一个已被堵住的位置
+            // 显示成待清理目标，重复清理时还会把占位目录搬进隔离区。
+            if !sys.fs.exists(&full) || is_placeholder(sys, tables, install_dir, rel) {
+                continue;
             }
+            // 「清空目录内容」型组件的目录会被刻意保留，空目录等同于已清理；
+            // 否则界面会长期挂着一个 0 KB 的待清理项
+            if id.moves_dir_contents() && sys.fs.is_empty_dir(&full) {
+                continue;
+            }
+            size += sys.fs.size_of(&full).unwrap_or(0);
+            paths.push(full);
         }
-
-        let kind = if paths.first().map(|p| sys.fs.is_dir(p)).unwrap_or(false) {
-            ComponentKind::Directory
-        } else {
-            ComponentKind::File
-        };
-
-        // 副标题只显示大小：路径等实现细节对用户没有信息量，
-        // 需要时可以看日志或文档，不必挤在勾选行上。
-        let detail = fmt_size(size);
 
         out.push(Component {
             id,
             label: id.label().to_owned(),
-            detail,
-            kind,
-            risk,
-            default_enabled,
-            size_bytes: if paths.is_empty() { None } else { Some(size) },
-            paths,
+            // 副标题只显示大小：路径等实现细节对用户没有信息量
+            detail: format!("（{}）", fmt_size(size)),
+            default_enabled: id.default_enabled(),
+            found: paths.len(),
         });
     }
     out
 }
 
-fn fmt_size(b: u64) -> String {
+/// 把字节数转成人类可读的短文本（如 `156 MB`、`3 KB`）。
+///
+/// 探测详情与界面日志共用；调用方按需自行加括号等修饰。
+pub fn fmt_size(b: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     if b as f64 >= MB {
-        format!("（{:.0} MB）", b as f64 / MB)
+        format!("{:.0} MB", b as f64 / MB)
     } else {
-        format!("（{:.0} KB）", b as f64 / 1024.0)
+        format!("{:.0} KB", b as f64 / 1024.0)
+    }
+}
+
+/// 该相对路径当前是否是「占位物」。
+///
+/// 判据是类型与预期相反：声明为 `dir_instead_of_file` 的目标本应是文件，
+/// 现在成了目录即视为占位物。据此可以区分「组件本体还在」与「组件已清理、
+/// 原位置被占位堵住」——没有这层判断，重复清理会把占位物当成组件搬进隔离区。
+/// 探测与清理共用这一个判定。
+pub fn is_placeholder(
+    sys: &SysContext,
+    tables: &Tables,
+    install_dir: &Path,
+    relative: &str,
+) -> bool {
+    let Some(kind) = tables.paths.placeholder_kind_for(relative) else {
+        return false;
+    };
+    let p = install_dir.join(relative);
+    if !sys.fs.exists(&p) {
+        return false;
+    }
+    match kind {
+        PlaceholderKind::DirInsteadOfFile => sys.fs.is_dir(&p),
+        PlaceholderKind::FileInsteadOfDir => !sys.fs.is_dir(&p),
     }
 }
 
@@ -182,7 +212,7 @@ fn fmt_size(b: u64) -> String {
 
 /// 两层都扫：`HKU\<SID>_Classes`（百度的关联键写在这里）+ `HKLM\Software\Classes`（防御性）
 ///
-/// 本函数只负责「列出候选」，不判断是否存在 —— 过滤交给 [`existing_registry_items`]。
+/// 本函数只按数据表展开候选，不查注册表；存在性过滤在 [`existing_registry_items`]。
 pub fn scan_registry(tables: &Tables, sid: &str) -> Vec<RegItem> {
     let mut items = tables.build_user_registry_items(sid);
     items.extend(tables.build_machine_registry_items());
@@ -205,8 +235,8 @@ pub fn scan_registry(tables: &Tables, sid: &str) -> Vec<RegItem> {
     items
 }
 
-/// 过滤出「实际存在」的项，避免 UI 展示一堆空项
-pub fn existing_registry_items(sys: &SysContext, items: &[RegItem]) -> Vec<RegItem> {
+/// 过滤出实际存在的项。探测阶段调用一次，结果随 [`Detection`] 下发。
+fn existing_registry_items(sys: &SysContext, items: &[RegItem]) -> Vec<RegItem> {
     items
         .iter()
         .filter(|i| match &i.value {
@@ -225,7 +255,6 @@ pub fn existing_registry_items(sys: &SysContext, items: &[RegItem]) -> Vec<RegIt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Risk;
     use crate::sys::SysContext;
     use crate::sys::mock::{FakeProcesses, InMemoryRegistry, NoopShell};
 
@@ -346,27 +375,181 @@ mod tests {
             b"x",
         )
         .unwrap();
-        std::fs::write(
-            dir.join(r"module\BrowserEngine\resources\video_player.asar"),
-            b"x",
-        )
-        .unwrap();
         std::fs::write(dir.join(r"module\VastPlayer\vastplayer.dll"), b"x").unwrap();
 
-        let comps = scan_components(&sys, &tables, &dir);
+        let comps = scan_components(&sys, &tables, &dir, &[]);
         // 所有组件条目都会出现，不存在的也保留，便于界面显示「已清理」
         assert_eq!(comps.len(), ComponentId::ALL.len());
 
         let find = |id: ComponentId| comps.iter().find(|c| c.id == id).unwrap();
 
-        // 智能看图与播放器启动器：安全，默认勾选
-        for id in [ComponentId::ImageViewer, ComponentId::PlayerLauncher] {
-            assert_eq!(find(id).risk, Risk::Safe, "{id:?} 应为安全项");
-            assert!(find(id).default_enabled, "{id:?} 默认应勾选");
+        // 假目录里确实存在的那三个
+        for id in [
+            ComponentId::ImageViewer,
+            ComponentId::PlayerLauncher,
+            ComponentId::PlayerLegacy,
+        ] {
             assert!(find(id).present(), "{id:?} 在假目录里存在");
         }
+        // 没有的那一个（关联项清单为空）不应显示为存在
+        assert!(!find(ComponentId::RegistryAssoc).present());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn placeholder_is_not_reported_as_present() {
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_detect_placeholder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(r"module\BrowserEngine")).unwrap();
+        // 启动器位置被占位目录堵住（上一次清理 + 加固的结果）
+        std::fs::create_dir_all(dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe"))
+            .unwrap();
+
+        let sys = ctx(InMemoryRegistry::new(), FakeProcesses::new());
+        let comps = scan_components(&sys, &tables, &dir, &[]);
+        let launcher = comps
+            .iter()
+            .find(|c| c.id == ComponentId::PlayerLauncher)
+            .unwrap();
+
+        assert!(!launcher.present(), "占位物不应算作组件仍存在");
+        assert_eq!(launcher.found, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emptied_component_dir_counts_as_cleaned() {
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_detect_emptied_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        // 目录本身被刻意保留，内容已清空
+        std::fs::create_dir_all(dir.join(r"module\ImageViewer")).unwrap();
+
+        let sys = ctx(InMemoryRegistry::new(), FakeProcesses::new());
+        let comps = scan_components(&sys, &tables, &dir, &[]);
+        let viewer = comps
+            .iter()
+            .find(|c| c.id == ComponentId::ImageViewer)
+            .unwrap();
+        assert!(
+            !viewer.present(),
+            "空目录应视为已清理，而不是一个 0 KB 的目标"
+        );
+
+        // 客户端重新部署后应再次被识别为存在
+        std::fs::write(dir.join(r"module\ImageViewer\Qt5Core.dll"), b"qt").unwrap();
+        let comps = scan_components(&sys, &tables, &dir, &[]);
+        let viewer = comps
+            .iter()
+            .find(|c| c.id == ComponentId::ImageViewer)
+            .unwrap();
+        assert!(viewer.present(), "目录内有内容时应视为存在");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_component_reflects_actual_hit_count() {
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_detect_registry_count");
+        let _ = std::fs::create_dir_all(&dir);
+        let sys = ctx(InMemoryRegistry::new(), FakeProcesses::new());
+
+        let items = (0..7)
+            .map(|i| RegItem {
+                path: crate::model::RegPath::hku(format!("S-x-{i}")),
+                value: None,
+            })
+            .collect::<Vec<_>>();
+        let find = |items: &[RegItem]| {
+            scan_components(&sys, &tables, &dir, items)
+                .into_iter()
+                .find(|c| c.id == ComponentId::RegistryAssoc)
+                .unwrap()
+        };
+
+        // 没有命中任何关联项 → 与已清理的文件组件一样显示「已清理」
+        let none = find(&[]);
+        assert!(!none.present(), "没有命中项时不应显示为存在");
+        assert_eq!(none.found, 0);
+
+        // 命中 7 项 → 存在，且副标题是命中数而不是候选清单长度
+        let some = find(&items);
+        assert!(some.present());
+        assert_eq!(some.found, 7);
+        assert_eq!(some.detail, "已发现 7 项");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn placeholder_detection_keys_on_opposite_type() {
+        let tables = Tables::load().unwrap();
+        let dir = std::env::temp_dir().join("bc_data_placeholder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(r"module\BrowserEngine")).unwrap();
+        let sys = ctx(InMemoryRegistry::new(), FakeProcesses::new());
+
+        // 启动器声明为 dir_instead_of_file：本该是文件
+        let rel = r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe";
+        assert!(
+            !is_placeholder(&sys, &tables, &dir, rel),
+            "目标不存在时不算占位物"
+        );
+
+        std::fs::write(dir.join(rel), b"x").unwrap();
+        assert!(
+            !is_placeholder(&sys, &tables, &dir, rel),
+            "本体是文件时不算占位物"
+        );
+
+        std::fs::remove_file(dir.join(rel)).unwrap();
+        std::fs::create_dir_all(dir.join(rel)).unwrap();
+        assert!(
+            is_placeholder(&sys, &tables, &dir, rel),
+            "类型相反时才是占位物"
+        );
+
+        // 未声明为占位目标的路径一律不算占位物，哪怕它恰好是个目录
+        assert!(!is_placeholder(&sys, &tables, &dir, r"module\ImageViewer"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_component_touches_player_resources_or_startup_files() {
+        // 「不得触碰的文件」直接取自数据表（禁区表 + 启动必需清单），
+        // 不在此维护第二份清单
+        let tables = Tables::load().unwrap();
+        for id in ComponentId::ALL {
+            for rel in id.relative_paths() {
+                assert!(
+                    !crate::guard::is_forbidden(&tables.forbidden, rel),
+                    "{id:?} 的目标 {rel} 属于禁区保护的文件"
+                );
+                assert!(
+                    !tables
+                        .paths
+                        .required_files
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(rel)),
+                    "{id:?} 的目标 {rel} 属于启动必需文件"
+                );
+            }
+        }
+
+        // 旧版引擎只点名目录里的 DLL，同目录的 d3dx9_43.dll 必须留下
+        assert_eq!(
+            ComponentId::PlayerLegacy.relative_paths(),
+            &[r"module\VastPlayer\vastplayer.dll"]
+        );
+        assert!(
+            !ComponentId::PlayerLegacy.moves_dir_contents(),
+            "旧版引擎目录里有正在被加载的 d3dx9_43.dll，不能整目录清空"
+        );
     }
 
     #[test]

@@ -24,20 +24,47 @@ pub struct Quarantine {
     pub install_dir: PathBuf,
 }
 
-/// 默认隔离区根目录：安装目录的同级目录下。
+/// 默认隔离区根目录：安装目录所在卷的根目录下。
 ///
 /// 例如安装在 `D:\Program Files\BaiduNetdisk`，隔离区就在
-/// `D:\Program Files\imageviewer-cleaner\quarantine`。
-/// 放在同级目录既满足同卷要求（同卷移动才是原子改名），
-/// 也避免在磁盘根目录下新建一个显眼的文件夹。
+/// `D:\imageviewer-cleaner\quarantine`。本工具是免安装的绿色软件，不应该在
+/// `Program Files` 里留下一个看似安装目录的文件夹，因此放在安装卷根目录、
+/// 整层加隐藏属性：既满足同卷要求（同卷移动才是原子改名），也与工具自身
+/// 被放在哪里、会不会被删无关。
 pub fn default_root(install_dir: &Path) -> Result<PathBuf> {
-    let parent = install_dir
-        .parent()
-        .ok_or_else(|| Error::io(install_dir, std::io::Error::other("安装目录没有上级目录")))?;
-    Ok(parent.join(QUARANTINE_DIR_NAME).join("quarantine"))
+    let volume = install_dir
+        .ancestors()
+        .last()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| Error::io(install_dir, std::io::Error::other("无法确定安装目录所在卷")))?;
+    Ok(volume.join(QUARANTINE_DIR_NAME).join("quarantine"))
 }
 
-/// 删除一份备份（用户确认网盘一切正常后释放空间用）
+/// 旧版隔离区位置：安装目录的同级目录。
+///
+/// 0.2.x 把备份放在这里，升级后旧备份仍要可还原、可删除，所以探测时会把
+/// 这个位置一并列出。安装在卷根目录时两个位置重合，返回 `None`。
+pub fn legacy_root(install_dir: &Path) -> Option<PathBuf> {
+    let old = install_dir
+        .parent()?
+        .join(QUARANTINE_DIR_NAME)
+        .join("quarantine");
+    match default_root(install_dir) {
+        Ok(new) if new == old => None,
+        _ => Some(old),
+    }
+}
+
+/// 「删除失败后重试」前的等待时长。资源管理器开着备份目录、杀毒软件正在
+/// 扫描等瞬时占用，等一小会儿通常就消失了。
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 删除一份备份（用户确认网盘一切正常后释放空间用）。
+///
+/// 资源管理器打开着备份目录、杀毒软件正在扫描时，Windows 会报
+/// 「另一个程序正在使用此文件」；这类占用是瞬时的，稍候重试一次通常即可成功。
+/// 删除成功后，若祖先目录里只剩本工具创建的空壳（`quarantine`、
+/// `imageviewer-cleaner` 两层），会一并移除，不在磁盘上留空文件夹。
 pub fn delete_backup(dir: &Path) -> Result<()> {
     if !dir.join("manifest.json").exists() {
         return Err(Error::io(
@@ -45,7 +72,34 @@ pub fn delete_backup(dir: &Path) -> Result<()> {
             std::io::Error::other("该目录不是有效的备份（缺少 manifest.json）"),
         ));
     }
-    std::fs::remove_dir_all(dir).map_err(|e| Error::io(dir, e))
+    if let Err(first) = std::fs::remove_dir_all(dir) {
+        std::thread::sleep(RETRY_DELAY);
+        if let Err(second) = std::fs::remove_dir_all(dir) {
+            // 首次失败可能已删掉大半，重试报错但目录实际已不存在时按成功算
+            if dir.exists() {
+                return Err(Error::io(
+                    dir,
+                    std::io::Error::other(format!("{first}；重试仍失败：{second}")),
+                ));
+            }
+        }
+    }
+    prune_empty_parents(dir);
+    Ok(())
+}
+
+/// 删除备份后把变空的祖先目录一并移除。只处理本工具创建的那两层
+/// （`quarantine` 与 `imageviewer-cleaner`），遇到非空或删不掉的目录立即停止。
+fn prune_empty_parents(dir: &Path) {
+    for anc in dir.ancestors().skip(1) {
+        let ours = anc
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == QUARANTINE_DIR_NAME || n == "quarantine");
+        if !ours || std::fs::remove_dir(anc).is_err() {
+            break;
+        }
+    }
 }
 
 impl Quarantine {
@@ -76,9 +130,20 @@ impl Quarantine {
         self.dir.join("files")
     }
 
-    /// 给隔离区根目录加隐藏属性，避免用户误删
+    /// 给隔离区所在的两层目录加隐藏属性，避免用户误删。
+    ///
+    /// 只藏内层会留下一个看似空置的 `imageviewer-cleaner` 文件夹，反而让人起疑。
     pub fn mark_hidden(&self, sys: &SysContext) {
         let _ = sys.fs.set_hidden(&self.root);
+        if let Some(top) = self.root.parent() {
+            let ours = top
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == QUARANTINE_DIR_NAME);
+            if ours {
+                let _ = sys.fs.set_hidden(top);
+            }
+        }
     }
 
     pub fn registry_dir(&self) -> PathBuf {
@@ -340,6 +405,74 @@ mod tests {
         let on_disk = q.read_manifest().unwrap();
         assert_eq!(on_disk.actions.len(), 1, "动作应在 finish 之前就落盘");
         assert!(on_disk.finished_at.is_none(), "尚未 finish");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn default_root_is_on_install_volume_root() {
+        // 嵌套安装（如 Program Files 下）时，隔离区在卷根目录，与安装目录同级无关
+        assert_eq!(
+            default_root(Path::new(r"D:\Program Files\BaiduNetdisk")).unwrap(),
+            Path::new(r"D:\imageviewer-cleaner\quarantine")
+        );
+        // 安装在卷根目录时位置不变
+        assert_eq!(
+            default_root(Path::new(r"D:\BaiduNetdisk")).unwrap(),
+            Path::new(r"D:\imageviewer-cleaner\quarantine")
+        );
+    }
+
+    #[test]
+    fn legacy_root_only_exists_for_nested_installs() {
+        assert_eq!(
+            legacy_root(Path::new(r"D:\Program Files\BaiduNetdisk")),
+            Some(PathBuf::from(
+                r"D:\Program Files\imageviewer-cleaner\quarantine"
+            ))
+        );
+        assert_eq!(legacy_root(Path::new(r"D:\BaiduNetdisk")), None);
+    }
+
+    #[test]
+    fn delete_backup_rejects_dirs_without_manifest() {
+        let base = std::env::temp_dir().join("bc_delete_invalid");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("not-a-backup");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(delete_backup(&dir).is_err());
+        assert!(dir.exists(), "不是备份的目录不得删除");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_backup_prunes_only_our_empty_ancestors() {
+        let base = std::env::temp_dir().join("bc_delete_prune");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base
+            .join("Program Files")
+            .join(QUARANTINE_DIR_NAME)
+            .join("quarantine")
+            .join("t1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+
+        delete_backup(&dir).unwrap();
+
+        assert!(!dir.exists());
+        assert!(
+            !base
+                .join("Program Files")
+                .join(QUARANTINE_DIR_NAME)
+                .exists(),
+            "本工具留下的空壳目录应被一并移除"
+        );
+        assert!(
+            base.join("Program Files").is_dir(),
+            "不属于自己的目录不得动"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

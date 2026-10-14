@@ -19,11 +19,12 @@
     "module\\SpeechSDK",
     "module\\KernelCom",
     "module\\BaiduNetdiskModuleList.db",
-    "module\\VastPlayer\\d3dx9_43.dll",
     "uninst.exe"
   ],
   "_comment_share": "module\\BrowserEngine\\resources 整体禁区。实测确认：清掉其中的 video_player.asar 后客户端反复启动失败并弹出兼容模式窗口，与清掉 vastplayer.dll 表现一致。browserengine.dll 里存在一张相邻的静态清单 `resources\\app.asar / resources\\core.asar / resources\\video_player.asar`，与客户端启动校验有关，因此整个 resources 子树一律不得触碰——不留任何例外。",
-  "_comment_player": "videoipc.dll 由主客户端进程加载、dls.dll 是插件系统宿主，二者与播放器共用，禁止清理。module\\VastPlayer\\d3dx9_43.dll 正被插件宿主（--plugin_id=3）加载，且该目录会被当作 DLL 搜索目录，必须保留。",
+  "_comment_player": "videoipc.dll 由主客户端进程加载，dls.dll 是插件系统宿主，二者与播放器共用，禁止清理。",
+  "_comment_d3dx9": "module\\VastPlayer\\d3dx9_43.dll 不属于禁区，它是播放器组件的清理目标——不要把它加回本表，同时登记在两边会让清理被禁区拦截，整次中止。它确实被宿主加载着（按模块完整路径确认，不是 System32 下字节数相同的那份），但实测确认移除后宿主回落到系统副本，客户端仍能正常启动。若日后新版本不再回落，再把这条路径加回禁区，并从 Player 的目标里删掉。",
+  "_comment_asar_staging": "module\\BrowserEngine\\module\\asar 是 asar 包的暂存目录（先落盘为 <名字>.new + <名字>.sig，校验通过再搬进 resources）。它不在 resources 子树内，因此不在该条禁区的覆盖范围内，播放器组件只点名其中属于播放器的那两个文件（video_player.asar.new / .sig）。同目录的 core.asar 同样是旧副本，但不属于播放器，不算作播放器的清理目标——把无关文件混进去会让用户误判风险范围。搬进 resources 之后的 video_player.asar 仍然是禁区，那才是启动校验表里的成员。",
   "_comment_vastplayer": "module\\BrowserEngine\\vastplayer.dll 是启动必需文件，实测确认不可清理：客户端启动时会无条件拉起 baidunetdiskhost.exe --plugin_id=3 --plugin_file_path=<该文件>（未播放任何视频时也在运行），移除后客户端反复启动失败并弹出兼容模式窗口。同名的 module\\VastPlayer\\vastplayer.dll 是另一份旧构建，已实测可清理。",
   "_comment_localplayer": "module\\BrowserEngine\\localplayer.dll 是**依据推断**列入禁区的，未经实测：它与已证实为启动必需的 vastplayer.dll 出现在 browserengine.dll 同一张静态文件清单里（kernel.dll / minosagent.dll / vastplayer.dll / bnusdk.dll / syncengine.dll / dls.dll / entsyncengine.dll / sec_sdk.dll / videoipc.dll / localplayer.dll），该清单很可能就是启动校验表。若日后要放开，必须先在真机上单独实测确认。",
   "_comment_role": "命中本表的操作会被 guard.rs::assert_not_forbidden 直接拒绝，整次清理中止并回滚。当前没有任何组件目标命中本表，因此正常运行中不会触发；它防的是「把禁区文件误加进组件目标」这类错误，也充当「客户端自身依赖」的登记清单。与 paths.json 的 required_files 分工：本表在删除之前拦截，required_files 在删除之后校验并回滚。"

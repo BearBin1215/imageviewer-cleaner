@@ -22,26 +22,25 @@ pub struct PathsTable {
     pub placeholder_targets: Vec<PlaceholderTarget>,
 }
 
-/// 一个占位目标：组件清理后，在原位置放置相反类型的同名对象
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// 一个占位目标：组件清理后，在某个清理目标的原位置放置相反类型的同名对象
+#[derive(Debug, Clone, Deserialize)]
 pub struct PlaceholderTarget {
     pub component: ComponentId,
+    /// 占位对象所在的相对路径，必须是该组件 `relative_paths()` 里的一项
+    ///
+    /// 组件合并之后，「第一项」不再能代表要占位的目标（一个组件有多个路径，
+    /// 其中只有入口点需要占位），所以这里点名具体路径。
+    pub relative_path: String,
     pub kind: PlaceholderKind,
 }
 
-impl PlaceholderTarget {
-    /// 占位对象的相对路径（取该组件 `relative_paths()` 的第一项，全项目唯一出处）
-    pub fn relative_path(&self) -> Option<&'static str> {
-        self.component.relative_paths().first().copied()
-    }
-}
-
 impl PathsTable {
-    /// 某个相对路径是否为占位目标；占位对象路径见 [`PlaceholderTarget::relative_path`]。
+    /// 某个相对路径是否为占位目标
     pub fn placeholder_kind_for(&self, relative: &str) -> Option<PlaceholderKind> {
         self.placeholder_targets
             .iter()
-            .find_map(|t| (t.relative_path() == Some(relative)).then_some(t.kind))
+            .find(|t| t.relative_path.eq_ignore_ascii_case(relative))
+            .map(|t| t.kind)
     }
 }
 

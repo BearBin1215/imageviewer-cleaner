@@ -10,18 +10,20 @@ Windows 桌面工具（Rust + egui）：移除百度网盘客户端捆绑的「�
 
 ## 运行约束
 
-以下约束在代码与测试中强制执行，改动相关逻辑前先了解它们：
+改动相关逻辑前先读这些，每条都有代码或测试作为强制点：
 
-- **禁区校验**：每次删除前必须经过 `guard.rs::assert_not_forbidden`——目标必须在安装目录内，且不在禁区表（`data/forbidden.json`）中。主客户端和播放器共用 `module\BrowserEngine`，误删会导致网盘无法启动。
-- **ImageViewer 目录本身保留**：只清空 `module\ImageViewer` 的内容（`ComponentId::moves_dir_contents`），移走整个目录会让客户端检测到模块缺失而拒绝启动。
-- **进程名精确匹配**：`data/processes.json` 的 `match` 字段必须为 `"exact"`；子串匹配会误杀 BaiduYunGuanjia 等其他产品。注意 `data.rs` 里的校验是 `debug_assert`，发布构建不生效，本条文档是发布构建下的唯一提示。
-- **注册表位于用户 hive**：类关联键位于 `HKU\<SID>_Classes`，SID 由 `detect/sid.rs` 解析目标用户；HKLM 层仅作为防御性补充。
-- **占位加固**：清理后在原位置放置同名反向占位对象（目录放只读文件，文件放同名目录），阻断重新部署；不影响客户端启动。
-- **隔离区在安装卷根目录**：备份放在安装目录所在卷根目录的 `imageviewer-cleaner\quarantine`（整层隐藏）。本工具免安装，不得在 `Program Files` 里留下看似安装目录的文件夹，位置也与工具自身放在哪里无关。旧版放在安装目录同级目录，`locate_backups` 仍会列出旧位置备份，删除后自动清掉变空的旧目录壳。
-- **穷尽匹配防遗漏**：`ComponentId` 的 `label()` / `relative_paths()` / `default_enabled()` 穷尽匹配全部变体，新增组件时编译器要求显式登记。
-- **失败保护**：隔离区建立后立即写入基线 manifest，之后每个操作完成都会同步写入磁盘（写前日志 `Journal`）；任何一步失败都复用还原层逻辑按相反顺序回滚。
+- **每次删除都要过禁区闸门**：`guard.rs::assert_not_forbidden` 要求目标位于安装目录内，且不在禁区表（`data/forbidden.json`，每条附理由）里。主客户端与播放器共用 `module\BrowserEngine`，误删会导致网盘无法启动。一个路径要么在禁区表里、要么是组件的清理目标，**不能同时登记在两边**——同时登记会让清理被禁区拦截，整次中止并回滚。
+- **新增清理目标先在真机上实测**：确认「移除后客户端能正常启动」才允许默认勾选。做法是先作为独立组件，在默认不勾选的状态下验证，通过后合并进所属组件，并把「为什么删得掉」写进 `model.rs` 里该目标的注释——那里是唯一的解释出处。
+- **`module\ImageViewer` 只清空内容，目录本身保留**（`ComponentId::moves_dir_contents`）：整目录移走会被客户端判定为模块缺失而拒绝启动。
+- **组件按用户意图划分，不按文件**：一个勾对应一个「用户想移除的捆绑功能」。按文件粒度提供选项等于让用户替代码做归类。可逆性不同的事必须分开勾——文件能从隔离区原样搬回，`UserChoice` 删掉只能让系统重新询问默认程序。
+- **只对会被重新部署的入口点占位**：`data/paths.json` 的 `placeholder_targets` 逐条点名具体路径，`harden.rs` 断言它属于该组件的清理目标；不属于的不得占位。
+- **通配前缀必须严格长于同目录的禁区/必需文件名**：`PrefixTarget` 的展开不做二次过滤，前缀一旦短到能匹配到引擎本体，展开就会把它一起删掉。`guard.rs` 里的两条断言保证：展开结果能过禁区闸门，且前缀覆盖不到 `required_files` 里的文件。探测与清理共用 `detect::component_rels()` 的展开，界面列出的与实际搬走的必须是同一批路径。
+- **进程名必须精确匹配**：`data/processes.json` 的 `match` 为 `"exact"`，子串匹配会误杀 BaiduYunGuanjia 等其他产品。`data.rs` 里那条校验只是 `debug_assert`，发布构建下不生效——本条是发布构建下唯一的提示。
+- **类关联键位于 `HKU\<SID>_Classes`**：SID 由 `detect/sid.rs` 解析目标用户；HKLM 层只是防御性补充。
+- **隔离区在安装卷根目录**：`imageviewer-cleaner\quarantine`，整层隐藏。本工具免安装，不得在 `Program Files` 里留下看似安装目录的文件夹，位置也与工具自身装在哪里无关。`locate_backups` 仍会列出旧位置（安装目录同级）的备份，不要当作 bug 移除。
+- **失败保护**：隔离区建立后立即写入基线 manifest，之后每个动作完成都同步落盘（写前日志 `Journal`）；任何一步失败都按相反顺序回滚。
 
-禁区清单保存在 `data/forbidden.json`（每条附理由），删除其中任何一项都会让网盘无法启动或反复启动失败。新增清理目标前，必须先在真机上实测「移除后客户端能正常启动」。
+判断某个目标会不会被重新部署，查安装目录自带的下发清单 `AutoUpdate\Download\AutoUpdate.xml`。它由更新程序落盘，可能滞后于当前版本，只能作为「百度下发过什么」的证据，不作为安全性判据。
 
 ## 常用命令
 

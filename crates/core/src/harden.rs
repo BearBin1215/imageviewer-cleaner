@@ -16,9 +16,9 @@ use crate::sys::SysContext;
 
 /// 建立占位物。目标仍存在时跳过，避免破坏现场。
 ///
-/// 占位清单来自 `data/paths.json` 的 `placeholder_targets`，占位对象路径见
-/// [`crate::data::PlaceholderTarget::relative_path`]。关键目标是堵住播放器启动器
-/// 与旧版引擎：没有它们，播放器即使代码包被重新下载也无法被调用。
+/// 占位清单来自 `data/paths.json` 的 `placeholder_targets`，每条点名一个具体路径。
+/// 关键目标是堵住播放器启动器与旧版引擎这两个入口：没有它们，播放器即使代码包被重新
+/// 下载也无法被调用。
 ///
 /// 只处理 `selected` 里的组件：未勾选的组件即使文件已缺失也不得占位，
 /// 否则「保留这个组件」的意愿会被加固逻辑覆盖。
@@ -33,10 +33,7 @@ pub fn apply(
         if !selected.contains(&target.component) {
             continue;
         }
-        let Some(rel) = target.relative_path() else {
-            continue;
-        };
-        let path = install_dir.join(rel);
+        let path = install_dir.join(&target.relative_path);
         if sys.fs.exists(&path) {
             continue;
         }
@@ -80,27 +77,53 @@ mod tests {
         }
     }
 
+    /// 占位清单必须点名到具体路径，而且只能点名该组件清理目标里的路径。
+    ///
+    /// 组件是按用户意图合并的（播放器一项有多个固定目标），「取第一个路径」这类
+    /// 推断会占位到错误文件上。这里同时固化了「哪些目标已被实测确认可移除」：
+    /// 新增占位目标要改这张表，就得先有实测依据。
     #[test]
-    fn placeholder_targets_cover_only_verified_components() {
+    fn placeholder_targets_name_verified_paths() {
         let tables = Tables::load().unwrap();
         let targets = &tables.paths.placeholder_targets;
-        let ids: Vec<ComponentId> = targets.iter().map(|t| t.component).collect();
+
+        let paths: Vec<&str> = targets.iter().map(|t| t.relative_path.as_str()).collect();
         assert_eq!(
-            ids,
-            vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy],
-            "占位目标应只覆盖实测确认可移除的组件"
+            paths,
+            vec![
+                r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe",
+                r"module\VastPlayer\vastplayer.dll",
+            ],
+            "占位目标应只覆盖实测确认可移除且会被重新部署的入口"
         );
 
         for t in targets {
             assert!(
-                !t.component.relative_paths().is_empty(),
-                "{:?} 没有相对路径，无法占位",
                 t.component
+                    .relative_paths()
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&t.relative_path)),
+                "{:?} 的占位路径 {} 不在它的清理目标里",
+                t.component,
+                t.relative_path
             );
             assert!(
                 !t.component.moves_dir_contents(),
                 "{:?} 是「清空目录内容」型组件，目录本身要保留，不该整目录占位",
                 t.component
+            );
+        }
+
+        // 同组件里不占位的那几个目标：旧目录的 D3D 运行库与暂存下载包
+        let skip = [
+            r"module\VastPlayer\d3dx9_43.dll",
+            r"module\BrowserEngine\module\asar\video_player.asar.new",
+            r"module\BrowserEngine\module\asar\video_player.asar.sig",
+        ];
+        for rel in skip {
+            assert!(
+                tables.paths.placeholder_kind_for(rel).is_none(),
+                "{rel} 不该被列为占位目标"
             );
         }
     }
@@ -113,7 +136,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let selected = vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy];
+        let selected = vec![ComponentId::Player];
         let mut j = journal();
         apply(&sys, &tables, &dir, &selected, &mut j).unwrap();
         let actions: Vec<Action> = j.actions().to_vec();
@@ -145,7 +168,7 @@ mod tests {
         let launcher = dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe");
         std::fs::write(&launcher, b"launch").unwrap();
 
-        let selected = vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy];
+        let selected = vec![ComponentId::Player];
         let mut j = journal();
         apply(&sys, &tables, &dir, &selected, &mut j).unwrap();
         assert!(launcher.is_file(), "仍存在的目标不得被占位物覆盖");

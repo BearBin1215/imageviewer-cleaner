@@ -74,6 +74,16 @@ mod tests {
             r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe"
         ));
         assert!(!is_forbidden(&t, r"module\VastPlayer\vastplayer.dll"));
+        // 更新备份：带 .old<时间戳> 后缀的目标不是禁区文件本体，通配展开能命中它，也能删除它
+        assert!(!is_forbidden(
+            &t,
+            r"module\BrowserEngine\vastplayer.dll.old20260608T084445"
+        ));
+        // asar 暂存目录不在 resources 子树内
+        assert!(!is_forbidden(
+            &t,
+            r"module\BrowserEngine\module\asar\video_player.asar.new"
+        ));
     }
 
     #[test]
@@ -86,10 +96,32 @@ mod tests {
         assert!(is_forbidden(&t, r"module\BrowserEngine\videoipc.dll"));
         // 插件系统宿主
         assert!(is_forbidden(&t, r"module\BrowserEngine\dls.dll"));
-        // 插件宿主正在加载的 D3D9 运行时，且位于会被当作 DLL 搜索目录的 VastPlayer 下
-        assert!(is_forbidden(&t, r"module\VastPlayer\d3dx9_43.dll"));
         // 推断列入：与 vastplayer.dll 同处 browserengine.dll 的启动校验清单
         assert!(is_forbidden(&t, r"module\BrowserEngine\localplayer.dll"));
+    }
+
+    /// `module\VastPlayer\d3dx9_43.dll` 已从禁区移出，是播放器组件的清理目标。
+    ///
+    /// 它确实被宿主加载着（按模块完整路径确认），但实测确认移除后宿主会回落到
+    /// `C:\Windows\System32` 下的同一份副本，客户端照常启动。这条断言把「移出」
+    /// 固化下来：如果日后新版本不再回落，正确做法是把它加回 `data/forbidden.json`
+    /// 并从 `ComponentId::Player` 的目标里删掉——同一个文件不能同时登记在两边，
+    /// 那样清理会被禁区拦截，整次中止。
+    #[test]
+    fn legacy_player_d3d_is_a_target_not_a_forbidden_path() {
+        use crate::model::ComponentId;
+
+        let t = table();
+        assert!(
+            !is_forbidden(&t, r"module\VastPlayer\d3dx9_43.dll"),
+            "d3dx9_43.dll 仍在禁区里，无法作为清理目标"
+        );
+        assert!(
+            ComponentId::Player
+                .relative_paths()
+                .contains(&r"module\VastPlayer\d3dx9_43.dll"),
+            "d3dx9_43.dll 应登记在播放器组件的目标清单里"
+        );
     }
 
     /// 不变量：任何组件声明的清理目标都不得是客户端启动必需文件。
@@ -112,6 +144,26 @@ mod tests {
                         .any(|r| r.eq_ignore_ascii_case(rel)),
                     "{id:?} 的清理目标 {rel} 是客户端启动必需文件，不得列入组件"
                 );
+            }
+            for pt in id.prefix_targets() {
+                // 通配前缀一旦短到能覆盖某个必需文件的文件名，展开就会把它一起删掉。
+                // 例如前缀写成 `vastplayer.dll` 会命中正在被加载的引擎本体。
+                for req in &tables.paths.required_files {
+                    // 根目录下的必需文件不可能出现在任何通配目录中
+                    let Some((req_dir, req_name)) = req.rsplit_once('\\') else {
+                        continue;
+                    };
+                    let same_dir = req_dir.eq_ignore_ascii_case(pt.dir.trim_end_matches('\\'));
+                    let covered = req_name
+                        .to_ascii_lowercase()
+                        .starts_with(&pt.prefix.to_ascii_lowercase());
+                    assert!(
+                        !(same_dir && covered),
+                        "{id:?} 的通配前缀 {}\\{} 会匹配到启动必需文件 {req}",
+                        pt.dir,
+                        pt.prefix
+                    );
+                }
             }
         }
     }
@@ -184,6 +236,8 @@ mod tests {
     ///
     /// 新增组件或给禁区表加条目时，这条断言会在测试阶段立刻暴露冲突，
     /// 而不是等到用户机器上才因 `Error::Forbidden` 中断整次清理。
+    /// 通配目标按其展开后的形态一并校验：目录本身、`dir\prefix`、
+    /// `dir\prefix + 时间戳` 都必须能通过。
     #[test]
     fn every_declared_component_target_passes_the_gate() {
         use crate::model::ComponentId;
@@ -197,6 +251,19 @@ mod tests {
                     "{id:?} 的清理目标 {rel} 被禁区拦截"
                 );
             }
+            for pt in id.prefix_targets() {
+                for rel in [
+                    pt.dir.to_owned(),
+                    format!("{}\\{}", pt.dir, pt.prefix),
+                    // 真实形态：前缀后面直接接时间戳
+                    format!("{}\\{}20260608T084445", pt.dir, pt.prefix),
+                ] {
+                    assert!(
+                        assert_not_forbidden(&t, &install, &install.join(&rel)).is_ok(),
+                        "{id:?} 的通配目标 {rel} 被禁区拦截"
+                    );
+                }
+            }
         }
     }
 
@@ -208,12 +275,7 @@ mod tests {
         let t = table();
         let install = PathBuf::from(r"D:\Program Files\BaiduNetdisk");
         for target in &Tables::load().unwrap().paths.placeholder_targets {
-            let rel = target
-                .component
-                .relative_paths()
-                .first()
-                .copied()
-                .expect("占位目标必须有相对路径");
+            let rel = target.relative_path.as_str();
             assert!(
                 assert_not_forbidden(&t, &install, &install.join(rel)).is_ok(),
                 "{:?} 的占位目标 {rel} 被禁区拦截",

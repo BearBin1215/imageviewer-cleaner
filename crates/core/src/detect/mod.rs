@@ -115,6 +115,30 @@ pub fn expand_env(s: &str) -> String {
 
 // ───────────────────────────── 组件扫描 ─────────────────────────────
 
+/// 组件声明的文件目标（相对安装目录），通配目标就地展开成实际命中的条目。
+///
+/// 探测与清理共用这一份展开结果：两处各写一遍匹配规则，会让界面显示的目标和
+/// 真正被搬走的目标不一致。返回的路径不保证存在——固定目标由调用方按存在性
+/// 过滤，通配展开本身只返回磁盘上有的条目。
+pub fn component_rels(install_dir: &Path, id: ComponentId) -> Vec<String> {
+    let mut out: Vec<String> = id.relative_paths().iter().map(|s| s.to_string()).collect();
+
+    for pt in id.prefix_targets() {
+        let Ok(entries) = std::fs::read_dir(install_dir.join(pt.dir)) else {
+            continue;
+        };
+        let prefix = pt.prefix.to_ascii_lowercase();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if name.starts_with(&prefix) {
+                out.push(format!("{}\\{}", pt.dir, e.file_name().to_string_lossy()));
+            }
+        }
+    }
+
+    out
+}
+
 /// 扫描组件清单。
 ///
 /// `registry_items` 是探测阶段实际命中的关联项：注册表组件没有文件路径，
@@ -143,7 +167,8 @@ pub fn scan_components(
         // 使界面能显示「已清理」
         let mut paths = Vec::new();
         let mut size = 0u64;
-        for rel in id.relative_paths() {
+        for rel in component_rels(install_dir, id) {
+            let rel = rel.as_str();
             let full = install_dir.join(rel);
             // 占位物不是组件本体。把它算作「存在」会让界面把一个已被堵住的位置
             // 显示成待清理目标，重复清理时还会把占位目录搬进隔离区。
@@ -383,12 +408,8 @@ mod tests {
 
         let find = |id: ComponentId| comps.iter().find(|c| c.id == id).unwrap();
 
-        // 假目录里确实存在的那三个
-        for id in [
-            ComponentId::ImageViewer,
-            ComponentId::PlayerLauncher,
-            ComponentId::PlayerLegacy,
-        ] {
+        // 假目录里确实存在的那两项
+        for id in [ComponentId::ImageViewer, ComponentId::Player] {
             assert!(find(id).present(), "{id:?} 在假目录里存在");
         }
         // 没有的那一个（关联项清单为空）不应显示为存在
@@ -409,12 +430,12 @@ mod tests {
 
         let sys = ctx(InMemoryRegistry::new(), FakeProcesses::new());
         let comps = scan_components(&sys, &tables, &dir, &[]);
-        let launcher = comps
-            .iter()
-            .find(|c| c.id == ComponentId::PlayerLauncher)
-            .unwrap();
+        let launcher = comps.iter().find(|c| c.id == ComponentId::Player).unwrap();
 
-        assert!(!launcher.present(), "占位物不应算作组件仍存在");
+        assert!(
+            !launcher.present(),
+            "占位物不应算作组件仍存在：唯一存在的那个目标已被占位目录取代"
+        );
         assert_eq!(launcher.found, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -541,15 +562,75 @@ mod tests {
             }
         }
 
-        // 旧版引擎只点名目录里的 DLL，同目录的 d3dx9_43.dll 必须留下
+        // 播放器合并的固定目标，逐个核对它们都在：`module\VastPlayer` 整个目录
+        // 已不在下发清单里（条目数为 0），里面的两个文件都可以删；`resources` 子树
+        // 依然完全不动
         assert_eq!(
-            ComponentId::PlayerLegacy.relative_paths(),
-            &[r"module\VastPlayer\vastplayer.dll"]
+            ComponentId::Player.relative_paths(),
+            &[
+                r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe",
+                r"module\VastPlayer\vastplayer.dll",
+                r"module\VastPlayer\d3dx9_43.dll",
+                r"module\BrowserEngine\module\asar\video_player.asar.new",
+                r"module\BrowserEngine\module\asar\video_player.asar.sig",
+            ]
         );
         assert!(
-            !ComponentId::PlayerLegacy.moves_dir_contents(),
-            "旧版引擎目录里有正在被加载的 d3dx9_43.dll，不能整目录清空"
+            !ComponentId::Player.moves_dir_contents(),
+            "播放器不得整目录清空：module\\VastPlayer 与 module\\BrowserEngine 都包含主客户端需要的文件"
         );
+    }
+
+    /// 通配目标就地展开成实际命中的条目，且展开结果不超出前缀的匹配范围。
+    ///
+    /// 这条测试检查的是展开规则本身：引擎本体 `vastplayer.dll` 必须留在结果之外，
+    /// 而新增的备份文件不用改代码就能被纳入。
+    #[test]
+    fn prefix_targets_expand_to_matching_entries_only() {
+        let dir = std::env::temp_dir().join("bc_detect_prefix");
+        let _ = std::fs::remove_dir_all(&dir);
+        let be = dir.join(r"module\BrowserEngine");
+        std::fs::create_dir_all(&be).unwrap();
+
+        // 禁区与启动必需的那个文件，加两个时间戳不同的备份
+        std::fs::write(be.join("vastplayer.dll"), b"engine").unwrap();
+        std::fs::write(be.join("vastplayer.dll.old20250825T082343"), b"a").unwrap();
+        std::fs::write(be.join("vastplayer.dll.old20260608T084445"), b"bb").unwrap();
+        // 不应命中的同目录条目：另一个必需 DLL，和一个仅大小写不同的同前缀条目
+        std::fs::write(be.join("videoipc.dll"), b"c").unwrap();
+        std::fs::write(be.join("VastPlayer.dll.old-x"), b"d").unwrap();
+
+        let rels = component_rels(&dir, ComponentId::Player);
+        // 五个固定目标 + 三个通配命中
+        assert_eq!(rels.len(), 8, "展开结果：{rels:?}");
+        assert!(
+            !rels
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(r"module\BrowserEngine\vastplayer.dll")),
+            "展开结果包含正在被加载的引擎本体：{rels:?}"
+        );
+        assert!(!rels.iter().any(|r| r.ends_with("videoipc.dll")));
+        // 大小写不同的同前缀条目也要命中：Windows 路径不区分大小写
+        assert!(rels
+            .iter()
+            .any(|r| r.ends_with("VastPlayer.dll.old-x") || r.ends_with("vastplayer.dll.old-x")));
+
+        // 没有通配目标的组件，展开结果就是固定清单
+        assert_eq!(
+            component_rels(&dir, ComponentId::ImageViewer),
+            vec![r"module\ImageViewer".to_owned()]
+        );
+
+        // 父目录不存在时不 panic：通配部分为空，只剩固定清单
+        let empty = std::env::temp_dir().join("bc_detect_prefix_none");
+        let _ = std::fs::remove_dir_all(&empty);
+        assert_eq!(
+            component_rels(&empty, ComponentId::Player).len(),
+            ComponentId::Player.relative_paths().len(),
+            "父目录缺失时应只返回固定清单"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

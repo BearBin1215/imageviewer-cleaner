@@ -41,9 +41,10 @@ pub fn run() {
                         "已清理".to_owned()
                     }
                 );
-                for rel in c.id.relative_paths() {
-                    let full = d.install_dir.join(rel);
-                    let state = if detect::is_placeholder(&sys, &tables, &d.install_dir, rel) {
+                // 与探测、清理共用同一次目标展开，通配目标在这里也是实际命中的条目
+                for rel in detect::component_rels(&d.install_dir, c.id) {
+                    let full = d.install_dir.join(&rel);
+                    let state = if detect::is_placeholder(&sys, &tables, &d.install_dir, &rel) {
                         if full.is_dir() {
                             "占位目录"
                         } else {

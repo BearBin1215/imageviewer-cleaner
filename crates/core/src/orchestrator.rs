@@ -313,8 +313,32 @@ mod tests {
         // 与播放器共用、必须原封不动的依赖
         std::fs::write(dir.join(r"module\BrowserEngine\videoipc.dll"), b"ipc").unwrap();
         std::fs::write(dir.join(r"module\BrowserEngine\localplayer.dll"), b"lp").unwrap();
-        std::fs::write(dir.join(r"module\VastPlayer\d3dx9_43.dll"), b"d3d").unwrap();
         std::fs::write(dir.join(r"module\VastPlayer\vastplayer.dll"), b"vpold").unwrap();
+        // 清理目标：旧目录的 D3D 运行库
+        std::fs::write(dir.join(r"module\VastPlayer\d3dx9_43.dll"), b"d3d").unwrap();
+        // 清理目标：引擎更新备份（通配命中）。引擎本体在同目录，不得被移走
+        std::fs::write(
+            dir.join(r"module\BrowserEngine\vastplayer.dll.old20250825T082343"),
+            b"old1",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(r"module\BrowserEngine\vastplayer.dll.old20260608T084445"),
+            b"old2",
+        )
+        .unwrap();
+        // 清理目标：播放器代码包已失效的暂存下载。已生效的那份在 resources 下，属禁区
+        std::fs::create_dir_all(dir.join(r"module\BrowserEngine\module\asar")).unwrap();
+        std::fs::write(
+            dir.join(r"module\BrowserEngine\module\asar\video_player.asar.new"),
+            b"staged",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(r"module\BrowserEngine\module\asar\video_player.asar.sig"),
+            b"sig",
+        )
+        .unwrap();
 
         let reg = InMemoryRegistry::new();
         reg.set_user_hives(vec![SID.into()]);
@@ -344,8 +368,9 @@ mod tests {
             .with_quarantine_root(qroot.clone());
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
-        // 看图目录内容 2 项 + 启动器 + 旧版引擎，全部组件都会被清理
-        assert_eq!(summary.files_moved, 4, "应移走全部目标");
+        // 全部组件都被清理：看图目录内容 2 项 + 启动器 + 旧版引擎 + D3D 运行库
+        // + 通配命中的更新备份 2 项 + 暂存下载包 2 项
+        assert_eq!(summary.files_moved, 9, "应移走全部目标");
         // 两个文件型组件需要占位；目录本身保留，不需要占位
         assert_eq!(summary.placeholders_created, 2);
         assert!(summary.registry_items_cleared > 0);
@@ -368,15 +393,28 @@ mod tests {
         );
         assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_dir());
 
-        // 禁区文件原封不动
+        // 新增的清理目标也已被移走
+        assert!(!dir.join(r"module\VastPlayer\d3dx9_43.dll").exists());
+        assert!(
+            !dir.join(r"module\BrowserEngine\vastplayer.dll.old20250825T082343")
+                .exists()
+        );
+        assert!(
+            !dir.join(r"module\BrowserEngine\module\asar\video_player.asar.new")
+                .exists()
+        );
+
+        // 禁区与启动必需文件原封不动。
+        // 其中 `module\BrowserEngine\vastplayer.dll` 的文件名正好是通配前缀
+        // `vastplayer.dll.old` 的开头——它还在，证明展开没有把正在被加载的引擎一并移走。
         for keep in [
             "BaiduNetdisk.exe",
             r"module\BrowserEngine\BaiduNetdiskUnite.exe",
             r"module\BrowserEngine\resources\app.asar",
+            r"module\BrowserEngine\resources\video_player.asar",
             r"module\BrowserEngine\vastplayer.dll",
             r"module\BrowserEngine\localplayer.dll",
             r"module\BrowserEngine\videoipc.dll",
-            r"module\VastPlayer\d3dx9_43.dll",
         ] {
             assert!(dir.join(keep).is_file(), "{keep} 不应被动到");
         }
@@ -402,6 +440,21 @@ mod tests {
             "还原应把占位目录换回原文件"
         );
         assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_file());
+
+        // 通配目标按展开后的原名还原：名字里带时间戳，不能靠固定清单对应回来
+        assert!(
+            dir.join(r"module\BrowserEngine\vastplayer.dll.old20250825T082343")
+                .is_file()
+        );
+        assert!(
+            dir.join(r"module\BrowserEngine\vastplayer.dll.old20260608T084445")
+                .is_file()
+        );
+        assert!(
+            dir.join(r"module\BrowserEngine\module\asar\video_player.asar.new")
+                .is_file()
+        );
+        assert!(dir.join(r"module\VastPlayer\d3dx9_43.dll").is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&qroot);
@@ -449,8 +502,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.join(r"module\BrowserEngine"));
         std::fs::write(dir.join(r"module\BrowserEngine"), b"x").unwrap();
 
-        let cfg = CleanupConfig::new(vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy])
-            .with_quarantine_root(qroot.clone());
+        let cfg = CleanupConfig::new(vec![ComponentId::Player]).with_quarantine_root(qroot.clone());
 
         let err = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap_err();
         assert!(
@@ -475,17 +527,19 @@ mod tests {
         let qroot = std::env::temp_dir().join("bc_orch_partial_q");
         let _ = std::fs::remove_dir_all(&qroot);
 
-        // 只勾播放器相关的两项：看图与文件关联都不勾
-        let cfg = CleanupConfig::new(vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy])
+        // 只勾播放器：看图与文件关联都不勾
+        let cfg = CleanupConfig::new(vec![ComponentId::Player])
             .with_harden(true)
             .with_quarantine_root(qroot.clone());
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
-        assert_eq!(summary.files_moved, 2, "只应动播放器启动器与旧版引擎");
+        // 播放器一项就覆盖五个固定目标加两个通配命中的更新备份
+        assert_eq!(summary.files_moved, 7, "应动播放器组件的全部目标");
         assert_eq!(
             summary.registry_items_cleared, 0,
             "未勾选文件关联时不得清理任何关联项"
         );
+        // 只有会被重新部署的两个入口点需要占位
         assert_eq!(summary.placeholders_created, 2);
 
         // 看图原封不动，也没被占位物堵住
@@ -495,12 +549,24 @@ mod tests {
         );
         assert!(dir.join(r"module\ImageViewer\Qt5Core.dll").is_file());
 
-        // 播放器两项已被移走并占位
+        // 播放器入口点已被移走并占位
         assert!(
             dir.join(r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe")
                 .is_dir()
         );
         assert!(dir.join(r"module\VastPlayer\vastplayer.dll").is_dir());
+        // 不占位的那几个也已被移走
+        assert!(!dir.join(r"module\VastPlayer\d3dx9_43.dll").exists());
+        assert!(
+            !dir.join(r"module\BrowserEngine\module\asar\video_player.asar.new")
+                .exists()
+        );
+        assert!(
+            !dir.join(r"module\BrowserEngine\vastplayer.dll.old20260608T084445")
+                .exists()
+        );
+        // 但正在被加载的引擎本体原样保留
+        assert!(dir.join(r"module\BrowserEngine\vastplayer.dll").is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&qroot);

@@ -28,9 +28,17 @@
     "module\\BrowserEngine\\vastplayer.dll"
   ],
 
-  "_comment_placeholder": "占位目标：组件被清理后，在原位置放置相反类型的同名对象（原本是文件的位置放目录），阻断客户端重建。占位对象路径见 data.rs 的 PlaceholderTarget::relative_path；只列实测确认「移除后客户端仍能正常启动」的组件。",
+  "_comment_placeholder": "占位目标：组件被清理后，在原位置放置相反类型的同名对象（原本是文件的位置放目录），阻断客户端重建。每个条目点名具体路径（必须是该组件 relative_paths 里的一项，由 harden.rs 的断言核对）。只列实测确认「移除后客户端仍能正常启动」的目标——播放器组件下其余的目标（d3dx9_43.dll、暂存目录里的 .new/.sig）不占位：前者删掉后宿主会回落到系统副本，不存在被重新部署的问题；后者本来就会被更新程序重新写入一份。",
   "placeholder_targets": [
-    { "component": "PlayerLauncher", "kind": "dir_instead_of_file" },
-    { "component": "PlayerLegacy", "kind": "dir_instead_of_file" }
+    {
+      "component": "Player",
+      "relative_path": "module\\BrowserEngine\\BaiduNetdiskPlayerLaunch.exe",
+      "kind": "dir_instead_of_file"
+    },
+    {
+      "component": "Player",
+      "relative_path": "module\\VastPlayer\\vastplayer.dll",
+      "kind": "dir_instead_of_file"
+    }
   ]
 }

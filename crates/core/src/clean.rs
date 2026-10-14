@@ -214,7 +214,9 @@ pub fn move_files(
     rep: &Reporter,
 ) -> Result<()> {
     for id in selected {
-        for rel in id.relative_paths() {
+        // 与探测层共用同一次目标展开，界面列出的和这里搬走的必定是同一批路径
+        for rel in detect::component_rels(install_dir, *id) {
+            let rel = rel.as_str();
             let target = install_dir.join(rel);
 
             // 「目录内容」型组件：逐个移走目录里的条目，保留目录本身
@@ -492,7 +494,7 @@ mod tests {
 
         let sys = sys_with(InMemoryRegistry::new(), FakeProcesses::new());
         let q = Quarantine::new(&dir, &dir, "t");
-        let selected = vec![ComponentId::PlayerLauncher, ComponentId::PlayerLegacy];
+        let selected = vec![ComponentId::Player];
         let mut j = journal();
         move_files(
             &sys,

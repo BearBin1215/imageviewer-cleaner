@@ -66,27 +66,44 @@ macro_rules! define_component_id {
     (@count) => { 0 };
 }
 
+/// 动态清理目标：在 `dir` 下枚举文件名以 `prefix` 开头的条目。
+///
+/// 用于名字里带时间戳、无法写成固定路径的目标（如更新程序留下的
+/// `vastplayer.dll.old20260608T084445`）。展开只发生在运行时，因此新增的
+/// 备份文件会被自动纳入，无需改数据表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixTarget {
+    /// 相对安装目录的父目录
+    pub dir: &'static str,
+    /// 文件名前缀（不区分大小写）
+    pub prefix: &'static str,
+}
+
 define_component_id! {
     /// 清理目标组件的唯一标识
+    ///
+    /// 划分单位是「用户想移除哪个捆绑功能」，不是文件。播放器的启动器、引擎残留、
+    /// 更新备份、暂存下载包合成一项：它们要么一起失效，要么一起还有意义，拆开
+    /// 只会让用户替代码做归类决定。
     pub enum ComponentId {
         /// 智能看图。
         /// 只清空 `module\ImageViewer` 的内容并保留目录本身：
         /// 整目录移走会让客户端检测到模块缺失而无法启动，
         /// 清空内容（含入口程序）则不影响客户端启动。
         ImageViewer,
-        /// 播放器启动器。
-        /// 它是文件关联的处理程序入口。实测确认：移除它之后客户端仍能正常启动。
-        PlayerLauncher,
-        /// 旧版播放器引擎。
+        /// 智能播放器。清理目标见 [`Self::relative_paths`] 与 [`Self::prefix_targets`]，
+        /// 每一项都实测确认「移除后客户端仍能正常启动并播放视频」。
         ///
-        /// `module\VastPlayer\vastplayer.dll` 是旧构建，运行中的宿主加载的是
-        /// BrowserEngine 下的同名文件（实测基线 8.8.8.101 中二者分别为
-        /// 2.2.4.10 与 2.2.4.14），它不在 `browserengine.dll` 的启动校验清单里。
-        /// 实测确认：移除后客户端能正常启动并播放视频。
+        /// 播放器真正在用的引擎 `module\BrowserEngine\vastplayer.dll`，以及
+        /// `videoipc.dll` / `dls.dll` / `localplayer.dll` / 整个 `resources` 子树都不在其中
+        /// ——它们与主客户端共用或被启动校验核对，是禁区（理由记在 `data/forbidden.json`）。
+        /// 换句话说，这项清理掉的是播放器的**入口与残留**，让功能失效，而不是移除引擎本体。
+        Player,
+        /// 文件关联。
         ///
-        /// 只点名这一个文件——同目录的 `d3dx9_43.dll` 正被插件宿主加载，必须留下。
-        PlayerLegacy,
-        /// 注册表关联
+        /// 与上面两个组件并列，不并入其中：这些键横跨看图与播放器，而且 `UserChoice`
+        /// 受 Windows 哈希保护，删掉只能让系统重新询问，无法精确还原。
+        /// 可逆性不同的事必须分开勾。
         RegistryAssoc,
     }
 }
@@ -95,8 +112,7 @@ impl ComponentId {
     pub fn label(self) -> &'static str {
         match self {
             Self::ImageViewer => "智能看图",
-            Self::PlayerLauncher => "播放器启动器",
-            Self::PlayerLegacy => "播放器旧版引擎",
+            Self::Player => "智能播放器",
             Self::RegistryAssoc => "文件关联",
         }
     }
@@ -106,13 +122,53 @@ impl ComponentId {
         matches!(self, Self::ImageViewer)
     }
 
-    /// 该组件要清理的相对路径。注册表组件没有文件路径，返回空。
+    /// 该组件要清理的固定相对路径。注册表组件没有文件路径，返回空。
+    ///
+    /// 这里逐条记下每个目标是什么、为什么删得掉——它们合并成一个界面选项之后，
+    /// 这份清单就是唯一的解释出处。
     pub fn relative_paths(self) -> &'static [&'static str] {
         match self {
+            // 看图：整个目录内容，见 moves_dir_contents
             Self::ImageViewer => &[r"module\ImageViewer"],
-            Self::PlayerLauncher => &[r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe"],
-            Self::PlayerLegacy => &[r"module\VastPlayer\vastplayer.dll"],
+            Self::Player => &[
+                // 启动器：文件关联的处理程序入口。没有它，播放器即使代码包被重新
+                // 下载也无法被调用，所以要占位。
+                r"module\BrowserEngine\BaiduNetdiskPlayerLaunch.exe",
+                // 旧构建引擎：运行中的宿主加载的是 BrowserEngine 下的同名文件
+                // （实测基线 8.8.8.101 中二者分别为 2.2.4.10 与 2.2.4.14），它不在
+                // browserengine.dll 的启动校验清单里。同样要占位。
+                r"module\VastPlayer\vastplayer.dll",
+                // 上面那份旧引擎的 D3D9 运行库。插件宿主加载的确实是这一份（按模块
+                // 完整路径确认），但实测确认移除后宿主会回落到 System32 下的同一份
+                // DirectX 9 副本，客户端照常启动。
+                // `module\VastPlayer` 在下发清单里的条目数为 0，该目录不会再被重建。
+                r"module\VastPlayer\d3dx9_43.dll",
+                // 暂存目录里被放弃的旧下载：先落盘为 `<名字>.new` + `<名字>.sig`，校验
+                // 通过才搬进 resources。本机的 .new（md5 e69ea3f2…）与已生效的
+                // resources\video_player.asar（md5 a1eac2d6…，与下发清单声明值一致）
+                // 对不上。只碰暂存目录，不碰 resources 子树。
+                // 不占位：更新程序下次会重新写入一份，而它怎么校验、何时搬走，都未实测过。
+                r"module\BrowserEngine\module\asar\video_player.asar.new",
+                r"module\BrowserEngine\module\asar\video_player.asar.sig",
+            ],
             Self::RegistryAssoc => &[],
+        }
+    }
+
+    /// 该组件的动态清理目标（目录 + 文件名前缀）。穷尽匹配，新增变体必须显式登记。
+    ///
+    /// 用于名字里带时间戳、无法写成固定路径的目标。
+    pub fn prefix_targets(self) -> &'static [PrefixTarget] {
+        match self {
+            Self::Player => &[PrefixTarget {
+                dir: r"module\BrowserEngine",
+                // 更新程序每次替换引擎都把旧版本改名留在原地，本机已累积 9 个、共
+                // 221 MB；这些名字不在下发清单里，唯一保留价值是支持更新回滚。
+                // 前缀必须严格长于禁区文件 `vastplayer.dll`，否则展开会把正在被加载
+                // 的引擎本体一起删掉——这条由 guard.rs 的断言在测试期检查。
+                prefix: "vastplayer.dll.old",
+            }],
+            Self::ImageViewer | Self::RegistryAssoc => &[],
         }
     }
 
@@ -121,11 +177,12 @@ impl ComponentId {
     /// 这里刻意穷尽匹配全部变体：新增组件时若未显式登记默认勾选状态，编译会
     /// 失败，避免新组件在无人确认的情况下被默认勾选。当前全部默认勾选——它们
     /// 都是运行本工具就想清掉的东西；但清单本身是可选的，用户可以只清其中一部分。
+    ///
+    /// 清理目标在真机实测确认「移除后客户端能正常启动」之前不得默认勾选：先把它
+    /// 作为独立组件，在默认不勾选的状态下实测，通过后再合并进所属组件。
     pub fn default_enabled(self) -> bool {
         match self {
-            Self::ImageViewer | Self::PlayerLauncher | Self::PlayerLegacy | Self::RegistryAssoc => {
-                true
-            }
+            Self::ImageViewer | Self::Player | Self::RegistryAssoc => true,
         }
     }
 }
@@ -293,9 +350,92 @@ mod tests {
     fn component_set_is_deliberate() {
         assert_eq!(
             ComponentId::ALL.len(),
-            4,
+            3,
             "组件数量变了：新增组件会出现在可勾选清单里，请确认新目标确实可清，再更新本断言"
         );
+    }
+
+    /// 界面只有「看图 / 播放器 / 文件关联」，与用户想移除的捆绑功能一一对应。
+    ///
+    /// 出现按文件粒度命名的组件（如「播放器启动器」「播放器暂存包」）就说明划分
+    /// 又退回到了实现视角，用户被要求替代码做归类。
+    #[test]
+    fn components_are_grouped_by_user_intent() {
+        assert_eq!(
+            ComponentId::ALL
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>(),
+            vec!["智能看图", "智能播放器", "文件关联"]
+        );
+        // 播放器的目标分散在两个目录和一处通配前缀中，合并后仍是一项
+        assert_eq!(ComponentId::Player.relative_paths().len(), 5);
+        assert_eq!(ComponentId::Player.prefix_targets().len(), 1);
+    }
+
+    /// 同一个组件内部的清理目标，可逆性必须一致。
+    ///
+    /// 注册表组件单独成项就是因为 `UserChoice` 删掉后只能让系统重新询问，无法精确
+    /// 还原；文件组件删掉后却能原样搬回来。把两者并成一项会让「能还原」的承诺失真。
+    #[test]
+    fn registry_and_file_targets_stay_apart() {
+        assert!(ComponentId::RegistryAssoc.relative_paths().is_empty());
+        for id in [ComponentId::ImageViewer, ComponentId::Player] {
+            assert!(
+                !id.relative_paths().is_empty() || !id.prefix_targets().is_empty(),
+                "{id:?} 没有文件目标"
+            );
+        }
+    }
+
+    /// 每个组件都必须有某种目标：既没有固定路径也没有通配路径，又不是注册表组件的，
+    /// 在界面上会显示成一个勾选后没有任何效果的条目。
+    #[test]
+    fn every_file_component_declares_a_target() {
+        for id in ComponentId::ALL {
+            if id == ComponentId::RegistryAssoc {
+                continue;
+            }
+            assert!(
+                !id.relative_paths().is_empty() || !id.prefix_targets().is_empty(),
+                "{id:?} 既没有固定路径也没有通配目标"
+            );
+        }
+    }
+
+    /// 播放器组件的通配前缀必须严格长于同目录的禁区文件名。
+    ///
+    /// `Player` 匹配 `vastplayer.dll.old*`，而正在被宿主加载的
+    /// `module\BrowserEngine\vastplayer.dll` 绝不能出现在展开结果里。
+    #[test]
+    fn prefix_target_cannot_swallow_the_live_engine() {
+        use crate::data::Tables;
+        use crate::guard;
+
+        let t = &Tables::load().unwrap().forbidden;
+        for id in ComponentId::ALL {
+            for pt in id.prefix_targets() {
+                // 前缀本身（尚未接上时间戳）不得是一个禁区文件
+                assert!(
+                    !guard::is_forbidden(t, &format!("{}\\{}", pt.dir, pt.prefix)),
+                    "{id:?} 的通配前缀 {}\\{} 本身属于禁区",
+                    pt.dir,
+                    pt.prefix
+                );
+                // 接上时间戳之后的样本可清理，否则整次清理会被禁区拦截并回滚
+                let sample = format!("{}\\{}20260608T084445", pt.dir, pt.prefix);
+                assert!(
+                    !guard::is_forbidden(t, &sample),
+                    "通配目标 {sample} 被禁区拦截，清理会整次中止并回滚"
+                );
+            }
+        }
+
+        // 反向验证：正在使用的引擎本体仍在禁区里，通配前缀比它更长，匹配不到它
+        assert!(guard::is_forbidden(
+            t,
+            r"module\BrowserEngine\vastplayer.dll"
+        ));
     }
 
     /// `ALL` 与枚举由 [`define_component_id!`] 从同一份变体列表生成，

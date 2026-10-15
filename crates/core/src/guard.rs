@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::data::ForbiddenTable;
 use crate::error::{Error, Result};
+use crate::sys::SysContext;
 
 fn normalize(s: &str) -> String {
     s.replace('/', "\\").trim_matches('\\').to_ascii_lowercase()
@@ -45,6 +46,24 @@ pub fn assert_not_forbidden(t: &ForbiddenTable, install_dir: &Path, target: &Pat
         return Err(Error::Forbidden(target.to_path_buf()));
     }
     Ok(())
+}
+
+/// 删除前的第二道校验：物理位置必须仍位于安装目录内。
+///
+/// [`assert_not_forbidden`] 只做词法比较，而目录联接（junction）能让一个
+/// 「安装目录内」的路径实际指向别处——Windows 上创建联接**不需要任何特权**，
+/// 因此这不是理论问题：把 `module\ImageViewer` 做成指向 `C:\Windows` 的联接，
+/// 词法闸门会照常放行，清理层却会把联接目标里的内容整体搬走。
+///
+/// 判定规则：安装目录本身允许是联接（装在别处再联通过来是常见做法），
+/// 但它**之下**的任何一段都不允许是重解析点。命中即视为异常现场，
+/// 与禁区一样中止整次清理，不静默跳过。
+pub fn assert_not_redirected(sys: &SysContext, install_dir: &Path, target: &Path) -> Result<()> {
+    if sys.fs.resolves_within(install_dir, target) {
+        Ok(())
+    } else {
+        Err(Error::Redirected(target.to_path_buf()))
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::backup::Journal;
 use crate::data::Tables;
 use crate::error::Result;
+use crate::guard;
 use crate::model::{Action, ComponentId, PlaceholderKind};
 use crate::sys::SysContext;
 
@@ -37,6 +38,9 @@ pub fn apply(
         if sys.fs.exists(&path) {
             continue;
         }
+        // 占位物要写在安装目录里，路径同样不能经过重解析点，
+        // 否则占位目录会建到别处，加固失效
+        guard::assert_not_redirected(sys, install_dir, &path)?;
         match target.kind {
             PlaceholderKind::FileInsteadOfDir => sys.fs.create_placeholder_file(&path)?,
             PlaceholderKind::DirInsteadOfFile => sys.fs.create_placeholder_dir(&path)?,

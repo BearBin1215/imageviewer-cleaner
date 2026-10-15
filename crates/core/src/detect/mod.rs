@@ -237,7 +237,7 @@ pub fn is_placeholder(
 
 /// 两层都扫：`HKU\<SID>_Classes`（百度的关联键写在这里）+ `HKLM\Software\Classes`（防御性）
 ///
-/// 本函数只按数据表展开候选，不查注册表；存在性过滤在 [`existing_registry_items`]。
+/// 本函数只按数据表展开候选，不查注册表；存在性过滤在 `existing_registry_items`。
 pub fn scan_registry(tables: &Tables, sid: &str) -> Vec<RegItem> {
     let mut items = tables.build_user_registry_items(sid);
     items.extend(tables.build_machine_registry_items());

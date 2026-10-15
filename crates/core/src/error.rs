@@ -16,6 +16,9 @@ pub enum Error {
     #[error("目标被禁区保护拦截: {0}")]
     Forbidden(PathBuf),
 
+    #[error("目标路径经过重解析点（联接/符号链接），实际位置不在安装目录内：{0}")]
+    Redirected(PathBuf),
+
     #[error("跨卷移动空间不足：需要 {need} 字节，可用 {free} 字节")]
     NoSpace { need: u64, free: u64 },
 

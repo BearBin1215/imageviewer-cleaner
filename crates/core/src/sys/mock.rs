@@ -107,7 +107,9 @@ impl RegistryBackend for InMemoryRegistry {
         value: &crate::sys::regfile::RegValue,
     ) -> Result<()> {
         let text = match value {
-            crate::sys::regfile::RegValue::Str(s) => s.clone(),
+            crate::sys::regfile::RegValue::Str(s) | crate::sys::regfile::RegValue::ExpandStr(s) => {
+                s.clone()
+            }
             crate::sys::regfile::RegValue::Dword(v) => v.to_string(),
             crate::sys::regfile::RegValue::Binary(b) => format!("{b:?}"),
         };
@@ -115,9 +117,15 @@ impl RegistryBackend for InMemoryRegistry {
         Ok(())
     }
 
-    fn import_reg_file(&self, _path: &std::path::Path) -> Result<()> {
-        // 替身不做真实导入；调用方只需知道「调用被接受了」
-        Ok(())
+    fn import_reg_file(&self, path: &std::path::Path, scope: &RegPath) -> Result<()> {
+        // 替身不访问真实注册表，但解析与作用域校验必须与真实实现一致，
+        // 否则测试会通过一个真实环境下会被拒绝的导入
+        let text = std::fs::read_to_string(path).map_err(|e| crate::error::Error::io(path, e))?;
+        let parsed = crate::sys::regfile::parse_full(&text)?;
+        crate::sys::regfile::check_scope(&parsed, scope)
+            .map_err(|e| crate::error::Error::RegFile(format!("{}：{e}", path.display())))?;
+
+        crate::sys::registry::apply_parsed(self, &parsed)
     }
 }
 

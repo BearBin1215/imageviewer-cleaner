@@ -224,6 +224,8 @@ pub fn move_files(
                 if !sys.fs.is_dir(&target) {
                     continue;
                 }
+                // 目录本身是联接时，read_dir 列出来的是联接目标的内容
+                guard::assert_not_redirected(sys, install_dir, &target)?;
                 let Ok(entries) = std::fs::read_dir(&target) else {
                     continue;
                 };
@@ -232,6 +234,7 @@ pub fn move_files(
                     let child = install_dir.join(&child_rel);
                     // 禁区命中是致命错误：直接返回错误，不做任何删除
                     guard::assert_not_forbidden(&tables.forbidden, install_dir, &child)?;
+                    guard::assert_not_redirected(sys, install_dir, &child)?;
                     if !sys.fs.exists(&child) {
                         continue;
                     }
@@ -251,6 +254,7 @@ pub fn move_files(
                 rep.info(format!("{rel} 已被占位物堵住，跳过"));
                 continue;
             }
+            guard::assert_not_redirected(sys, install_dir, &target)?;
             move_one(sys, q, journal, rel, rep)?;
         }
     }
@@ -596,5 +600,62 @@ mod tests {
         assert_eq!(RegRoot::Hku, RegRoot::Hku);
         let p = RegPath::hklm("Software\\Classes");
         assert_eq!(p.root_name(), "HKLM");
+    }
+
+    /// 目录联接必须被拒绝：词法闸门对「安装目录内」的路径一律放行，
+    /// 而联接能让这个路径实际指向别处——联接的创建不需要任何特权。
+    #[test]
+    fn move_files_refuses_junctioned_target() {
+        let tables = Tables::load().unwrap();
+        let base = std::env::temp_dir().join("bc_clean_junction");
+        let _ = std::fs::remove_dir_all(&base);
+        let install = base.join("install");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(install.join("module")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+
+        let link = install.join("module").join("ImageViewer");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            println!("跳过：无法创建 junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let sys = sys_with(InMemoryRegistry::new(), FakeProcesses::new());
+        let q = Quarantine::new(&base.join("q"), &install, "t");
+        let mut j = journal();
+        let err = move_files(
+            &sys,
+            &tables,
+            &install,
+            &[ComponentId::ImageViewer],
+            &q,
+            &mut j,
+            &Reporter::silent(),
+        );
+
+        assert!(
+            matches!(err, Err(Error::Redirected(_))),
+            "经过联接的目标必须被拒绝，实际 {err:?}"
+        );
+        assert!(
+            outside.join("secret.txt").is_file(),
+            "安装目录之外的文件不得被搬走"
+        );
+        assert!(j.actions().is_empty(), "拒绝之后不得留下任何动作记录");
+
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "rmdir"])
+            .arg(&link)
+            .status();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -17,8 +17,13 @@ pub struct RegEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegValue {
+    /// `REG_SZ`
     Str(String),
+    /// `REG_EXPAND_SZ` —— 含 `%VAR%` 的路径必须保住类型，否则还原后不再展开
+    ExpandStr(String),
+    /// `REG_DWORD`
     Dword(u32),
+    /// `REG_BINARY` 及一切无法用文本表达的类型
     Binary(Vec<u8>),
 }
 
@@ -56,10 +61,16 @@ pub fn parse_full(text: &str) -> Result<Parsed> {
         let Some(path) = current.clone() else {
             return Err(Error::RegFile("值出现在键之前".into()));
         };
-        let name = if lhs.trim() == "@" {
+        let raw_name = lhs.trim();
+        let name = if raw_name == "@" {
             None
         } else {
-            Some(unescape(lhs.trim().trim_matches('"')))
+            // 只剥掉一对包裹引号：名字本身可能含引号，用 trim_matches 会一并删掉
+            let inner = raw_name
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(raw_name);
+            Some(unescape(inner))
         };
         entries.push(RegEntry {
             path,
@@ -68,6 +79,28 @@ pub fn parse_full(text: &str) -> Result<Parsed> {
         });
     }
     Ok(Parsed { keys, entries })
+}
+
+/// 校验解析结果里的每个键都位于 `scope` 之内（等于它，或位于它的子树里）。
+///
+/// `.reg` 是磁盘上的输入，可能被替换成任意内容；调用方在写回注册表之前必须
+/// 用这一关把它限制在「本次允许还原的那个键」之内。真实后端与测试替身共用
+/// 本函数，避免出现「替身放行、真实环境拒绝」的假通过。
+pub fn check_scope(parsed: &Parsed, scope: &RegPath) -> Result<()> {
+    for key in parsed
+        .keys
+        .iter()
+        .chain(parsed.entries.iter().map(|e| &e.path))
+    {
+        if !key.is_within(scope) {
+            return Err(Error::RegFile(format!(
+                "含作用域之外的键 {}（本次只允许 {} 及其子树）",
+                key.full(),
+                scope.full()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_key(s: &str) -> Result<RegPath> {
@@ -95,18 +128,20 @@ fn parse_value(s: &str) -> Result<RegValue> {
         return Ok(RegValue::Dword(v));
     }
 
+    // `hex(2):` 是 reg.exe 对 REG_EXPAND_SZ 的十六进制写法（内容为 UTF-16LE
+    // 字节），导出时用它把类型原样带回
+    if let Some(hex) = s.strip_prefix("hex(2):") {
+        return Ok(RegValue::ExpandStr(decode_utf16(&parse_hex_bytes(hex)?)));
+    }
+
+    // `hex(1):` 是 reg.exe 对 REG_SZ 的十六进制写法，用于无法安全写成
+    // 引号字符串的内容（如含换行的数据）
+    if let Some(hex) = s.strip_prefix("hex(1):") {
+        return Ok(RegValue::Str(decode_utf16(&parse_hex_bytes(hex)?)));
+    }
+
     if let Some(hex) = s.strip_prefix("hex:") {
-        let bytes = if hex.trim().is_empty() {
-            Vec::new()
-        } else {
-            hex.split(',')
-                .map(|b| {
-                    u8::from_str_radix(b.trim(), 16)
-                        .map_err(|e| Error::RegFile(format!("hex 解析失败：{e}")))
-                })
-                .collect::<Result<Vec<u8>>>()?
-        };
-        return Ok(RegValue::Binary(bytes));
+        return Ok(RegValue::Binary(parse_hex_bytes(hex)?));
     }
 
     // 字符串：去掉首尾引号并反转义
@@ -116,6 +151,30 @@ fn parse_value(s: &str) -> Result<RegValue> {
         .and_then(|x| x.strip_suffix('"'))
         .ok_or_else(|| Error::RegFile(format!("无法识别的值：{s}")))?;
     Ok(RegValue::Str(unescape(inner)))
+}
+
+/// 解析 `aa,bb,cc` 形式的十六进制字节串
+fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>> {
+    if hex.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    hex.split(',')
+        .map(|b| {
+            u8::from_str_radix(b.trim(), 16)
+                .map_err(|e| Error::RegFile(format!("hex 解析失败：{e}")))
+        })
+        .collect()
+}
+
+/// UTF-16LE 字节 → 字符串（在第一个结尾 0 处截断）。
+/// 注册表原始值数据与 `.reg` 十六进制写法共用这一解码。
+pub(crate) fn decode_utf16(data: &[u8]) -> String {
+    let u16s: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16_lossy(&u16s)
 }
 
 /// 反转义 `\\` 与 `\"`

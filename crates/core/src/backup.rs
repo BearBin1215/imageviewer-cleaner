@@ -9,11 +9,16 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::model::{Action, Manifest, RegItem};
+use crate::progress::Reporter;
 use crate::sys::SysContext;
 use crate::sys::wide;
 
 /// 隔离区根目录名（放在安装目录所在卷下）
 pub const QUARANTINE_DIR_NAME: &str = "imageviewer-cleaner";
+
+/// `manifest.json` 的体积上限。一次清理的动作条数在几百量级，
+/// 正常文件只有几十 KB；超过这个数说明文件异常。
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 一次清理操作对应的隔离区
 pub struct Quarantine {
@@ -21,7 +26,15 @@ pub struct Quarantine {
     pub root: PathBuf,
     /// 本次操作的目录，如 `D:\imageviewer-cleaner\quarantine\20261011-132600`
     pub dir: PathBuf,
+    /// 安装目录。只有 [`Quarantine::new`] 构造的实例（清理时）会用到，
+    /// 见 [`Quarantine::move_into`]。
     pub install_dir: PathBuf,
+    /// 建立时是否把权限收紧为「仅管理员可访问」。
+    ///
+    /// 生产路径必须开启。测试置 false：收紧之后非提权的测试进程连自己写进去的
+    /// manifest 都读不到，无法驱动还原流程。与 `CleanupConfig::quarantine_root`
+    /// 一样，这是给测试留的口子。
+    restrict_acl: bool,
 }
 
 /// 默认隔离区根目录：安装目录所在卷的根目录下。
@@ -109,11 +122,14 @@ impl Quarantine {
             root: root.to_path_buf(),
             dir: root.join(stamp),
             install_dir: install_dir.to_path_buf(),
+            restrict_acl: true,
         }
     }
 
-    /// 从已存在的隔离区目录构造（还原时用），根目录由该目录反推。
-    pub fn at(dir: impl Into<PathBuf>, install_dir: impl Into<PathBuf>) -> Self {
+    /// 从已存在的隔离区目录构造（还原、列出备份时用），根目录由该目录反推。
+    ///
+    /// 这一路径只读备份，因此不记录安装目录。
+    pub fn at(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         let root = dir
             .parent()
@@ -122,8 +138,82 @@ impl Quarantine {
         Self {
             root,
             dir,
-            install_dir: install_dir.into(),
+            install_dir: PathBuf::new(),
+            restrict_acl: true,
         }
+    }
+
+    /// 设置是否收紧权限。生产路径保持默认的 `true`，测试传 `false`。
+    pub fn with_acl_restriction(mut self, on: bool) -> Self {
+        self.restrict_acl = on;
+        self
+    }
+
+    /// 关闭权限收紧（仅测试使用）
+    pub fn without_acl_restriction(self) -> Self {
+        self.with_acl_restriction(false)
+    }
+
+    /// 需要收紧权限的目录链，从最外层到本次操作的目录。
+    ///
+    /// 逐层收紧：只收紧最内层没有意义，外层可写就能删掉内层目录再重建一个。
+    /// 命名不符（自定义根目录）时只收紧实际用到的两层。
+    fn levels(&self) -> Vec<PathBuf> {
+        let mut v = vec![self.root.clone(), self.dir.clone()];
+        let named_ours = self
+            .root
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some(QUARANTINE_DIR_NAME);
+        if named_ours {
+            if let Some(top) = self.root.parent() {
+                v.insert(0, top.to_path_buf());
+            }
+        }
+        v
+    }
+
+    /// 建立隔离区目录并立即收紧权限。**必须在任何写入之前调用。**
+    ///
+    /// 卷根的默认 ACL 会把 `Authenticated Users:(OI)(CI)(IO)(M)` 继承给新建的
+    /// 每一层目录，任何普通用户都能读写隔离区里的 manifest 与注册表导出，而
+    /// manifest 是还原阶段的输入，被改动就会让还原内容不可控。
+    ///
+    /// 同时拒绝使用重解析点路径：权限收紧作用在联接自身，写入仍会到达联接
+    /// 指向的位置，收紧同样没有意义。
+    ///
+    /// 权限收紧失败只告警、不中止：FAT32 / exFAT 等文件系统根本不支持 ACL，
+    /// 硬失败会让这些卷上的清理完全不可用。此时还原侧仍受 manifest 路径闸门
+    /// 与注册表作用域约束，只是少了一层纵深防御。
+    pub fn prepare(&self, sys: &SysContext, rep: &Reporter) -> Result<()> {
+        for level in self.levels() {
+            if sys.fs.exists(&level) {
+                if sys.fs.is_reparse_point(&level) {
+                    return Err(Error::io(
+                        &level,
+                        std::io::Error::other("隔离区路径是重解析点（联接或符号链接），拒绝使用"),
+                    ));
+                }
+                if !sys.fs.is_dir(&level) {
+                    return Err(Error::io(
+                        &level,
+                        std::io::Error::other("隔离区路径不是目录"),
+                    ));
+                }
+            }
+            sys.fs.ensure_dir(&level)?;
+            if self.restrict_acl {
+                if let Err(e) = sys.fs.restrict_to_admins(&level) {
+                    rep.warn(format!(
+                        "无法收紧隔离区权限（{}）：{e}；\
+                         本机其他用户可能改写备份文件",
+                        level.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn files_dir(&self) -> PathBuf {
@@ -156,6 +246,8 @@ impl Quarantine {
 
     /// 把安装目录下的某个相对路径移入隔离区，保持原有的目录结构。
     /// 返回 (动作记录, 移动的字节数)。
+    ///
+    /// 只对 [`Self::new`] 构造的实例有效：`at` 构造的实例没有安装目录。
     pub fn move_into(&self, sys: &SysContext, relative: &str) -> Result<(Action, u64)> {
         let from = self.install_dir.join(relative);
         let to = self.files_dir().join(relative);
@@ -190,6 +282,18 @@ impl Quarantine {
 
     pub fn read_manifest(&self) -> Result<Manifest> {
         let path = self.manifest_path();
+        // manifest 是外部输入：先检查大小再看内容，避免把超大文件整体读入内存
+        let len = std::fs::metadata(&path)
+            .map_err(|e| Error::io(&path, e))?
+            .len();
+        if len > MAX_MANIFEST_BYTES {
+            return Err(Error::io(
+                &path,
+                std::io::Error::other(format!(
+                    "manifest.json 过大（{len} 字节，上限 {MAX_MANIFEST_BYTES}）"
+                )),
+            ));
+        }
         let text = std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
         serde_json::from_str(&text).map_err(|e| Error::data("manifest.json", e))
     }
@@ -212,8 +316,15 @@ pub struct Journal {
 
 impl Journal {
     /// 建立日志并在**任何破坏性动作之前**写入基线 manifest。
-    pub fn start(sys: &SysContext, q: &Quarantine, manifest: Manifest) -> Result<Self> {
-        sys.fs.ensure_dir(&q.dir)?;
+    pub fn start(
+        sys: &SysContext,
+        q: &Quarantine,
+        manifest: Manifest,
+        rep: &Reporter,
+    ) -> Result<Self> {
+        // 先建目录并收紧权限，再写入第一份 manifest：
+        // 权限必须在第一个字节落盘之前就位
+        q.prepare(sys, rep)?;
         let j = Self {
             path: Some(q.manifest_path()),
             manifest,
@@ -301,19 +412,59 @@ fn reg_file_name(item: &RegItem) -> String {
     format!("{s}.reg")
 }
 
+/// 一个可用备份的展示信息
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInfo {
+    pub dir: PathBuf,
+    /// 本次清理的开始时间（形如 `20261011-132600`）。读不到时退回目录名。
+    pub started_at: String,
+    /// 已记录的动作数（manifest 可解析时才有意义）
+    pub actions: usize,
+    /// manifest 无法解析（被截断或被改过）时为 false
+    pub manifest_ok: bool,
+}
+
 /// 列出某个根目录下所有可用的备份（即含 `manifest.json` 的子目录），最近的排在前面
-pub fn list_backups(root: &Path) -> Vec<PathBuf> {
+///
+/// 排序依据 manifest 记录的开始时间，不用路径字符串：路径里带着上级目录名，
+/// 新旧两个根目录混在一起时字典序排不出先后。
+pub fn list_backups(root: &Path) -> Vec<BackupInfo> {
     let Ok(rd) = std::fs::read_dir(root) else {
         return Vec::new();
     };
-    let mut v: Vec<PathBuf> = rd
+    let mut v: Vec<BackupInfo> = rd
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_dir() && p.join("manifest.json").is_file())
+        .map(describe_backup)
         .collect();
-    v.sort();
-    v.reverse();
+    v.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     v
+}
+
+/// 读出一份备份的展示信息；manifest 读不出来时不报错，只标记 `manifest_ok = false`
+fn describe_backup(dir: PathBuf) -> BackupInfo {
+    let q = Quarantine::at(dir.clone());
+    match q.read_manifest() {
+        Ok(m) => BackupInfo {
+            started_at: m.started_at,
+            actions: m.actions.len(),
+            manifest_ok: true,
+            dir,
+        },
+        Err(_) => BackupInfo {
+            // 读不出来时退回目录名——本工具正是用时间戳命名的，
+            // 至少还能排出先后
+            started_at: dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned(),
+            actions: 0,
+            manifest_ok: false,
+            dir,
+        },
+    }
 }
 
 /// 本地时间戳，形如 `20261011-132600`
@@ -382,7 +533,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let install = base.join("install");
         std::fs::create_dir_all(&install).unwrap();
-        let q = Quarantine::new(&base.join("quarantine"), &install, "t");
+        let q = Quarantine::new(&base.join("quarantine"), &install, "t").without_acl_restriction();
         let sys = SysContext::win32();
 
         let m = Manifest {
@@ -394,7 +545,7 @@ mod tests {
             target_user_sid: "S".into(),
             actions: Vec::new(),
         };
-        let mut j = Journal::start(&sys, &q, m).unwrap();
+        let mut j = Journal::start(&sys, &q, m, &Reporter::silent()).unwrap();
         j.record(Action::PlaceholderCreated {
             path: install.join("x"),
             kind: crate::model::PlaceholderKind::DirInsteadOfFile,

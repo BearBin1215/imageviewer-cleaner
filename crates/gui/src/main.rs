@@ -21,7 +21,7 @@ use std::thread;
 use eframe::egui;
 use egui::{Margin, RichText, Vec2};
 
-use imageviewer_cleaner_core::backup;
+use imageviewer_cleaner_core::backup::{self, BackupInfo};
 use imageviewer_cleaner_core::clean;
 use imageviewer_cleaner_core::data::Tables;
 use imageviewer_cleaner_core::detect;
@@ -110,7 +110,7 @@ enum Task {
 /// 弹窗底部：分隔线 + 右对齐按钮组。
 ///
 /// 用 `right_to_left` 布局，先添加的按钮排在最右，
-/// 因此调用处按「主按钮 → 次按钮」的顺序添加，视觉上得到 [次][主]。
+/// 因此调用处按「主按钮 → 次按钮」的顺序添加，视觉上得到 `[次][主]`。
 fn dialog_footer(ui: &mut egui::Ui, add_buttons: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(16.0);
     theme::hline(ui, theme::BORDER);
@@ -127,12 +127,29 @@ fn dialog_title(ui: &mut egui::Ui, text: &str) {
     ui.add_space(10.0);
 }
 
+/// 把 manifest 里的 `20261011-132600` 显示成 `2026-10-11 13:26:00`。
+/// 读不出时间的备份会退回目录名，此时原样返回。
+fn fmt_stamp(s: &str) -> String {
+    if s.len() == 15 && s.as_bytes().get(8) == Some(&b'-') {
+        return format!(
+            "{}-{}-{} {}:{}:{}",
+            &s[0..4],
+            &s[4..6],
+            &s[6..8],
+            &s[9..11],
+            &s[11..13],
+            &s[13..15]
+        );
+    }
+    s.to_owned()
+}
+
 struct App {
     /// 主任务的进度通道
     rx: Option<Receiver<Progress>>,
     task: Option<Task>,
     /// 备份列表的后台扫描通道
-    backups_rx: Option<Receiver<Vec<PathBuf>>>,
+    backups_rx: Option<Receiver<Vec<BackupInfo>>>,
     /// 打开清理确认框前的目标进程检查通道
     precheck_rx: Option<Receiver<Vec<String>>>,
 
@@ -143,6 +160,8 @@ struct App {
 
     /// 待确认的清理请求
     confirm_cleanup: bool,
+    /// 待确认的还原请求
+    confirm_restore: bool,
     /// 待确认的备份删除请求
     confirm_delete: Option<PathBuf>,
     /// 清理完成后的提示弹窗（值为本次的隔离区目录）
@@ -152,7 +171,9 @@ struct App {
     /// 是否建立占位物阻止重新部署。默认开启：占位法不会导致客户端无法启动。
     harden: bool,
     /// 可还原的备份（最近的排在前面）。全部保留，由用户确认后再删除。
-    backups: Vec<PathBuf>,
+    backups: Vec<BackupInfo>,
+    /// 当前选中的备份下标。还原与删除都以它为准，不再默默取第一份。
+    backup_choice: usize,
 }
 
 impl App {
@@ -167,12 +188,19 @@ impl App {
             log: Vec::new(),
             checks: BTreeMap::new(),
             confirm_cleanup: false,
+            confirm_restore: false,
             confirm_delete: None,
             cleanup_done: None,
             running_on_open: Vec::new(),
             harden: true,
             backups: Vec::new(),
+            backup_choice: 0,
         }
+    }
+
+    /// 当前选中的备份
+    fn chosen_backup(&self) -> Option<&BackupInfo> {
+        self.backups.get(self.backup_choice)
     }
 
     fn busy(&self) -> bool {
@@ -274,8 +302,9 @@ impl App {
         thread::spawn(move || {
             let rep = Reporter::new(tx, Box::new(move || wake.request_repaint()));
             let result: imageviewer_cleaner_core::Result<Summary> = (|| {
+                let tables = Tables::load()?;
                 let sys = SysContext::win32();
-                orchestrator::run_restore(&sys, &dir, &rep)?;
+                orchestrator::run_restore(&sys, &tables, &dir, &rep)?;
                 Ok(Summary::default())
             })();
             rep.emit(Progress::Finished(result));
@@ -402,6 +431,10 @@ impl App {
             if let Ok(list) = rx.try_recv() {
                 self.backups = list;
                 self.backups_rx = None;
+                // 列表变了之后把选中项夹回范围内，避免下标指向已消失的备份
+                if self.backup_choice >= self.backups.len() {
+                    self.backup_choice = 0;
+                }
             }
         }
         if let Some(rx) = &self.precheck_rx {
@@ -430,13 +463,14 @@ impl eframe::App for App {
         // UI 里只置标志，动作放到面板之外执行，避免闭包与 self 的借用冲突
         let mut act_scan = false;
         let mut act_ask_cleanup = false;
-        let mut restore_dir: Option<PathBuf> = None;
+        let mut act_ask_restore = false;
         let mut delete_dir: Option<PathBuf> = None;
 
         let busy = self.busy();
         let prechecking = self.precheck_rx.is_some();
         let backups = self.backups.clone();
         let has_backup = !backups.is_empty();
+        let chosen_dir = backups.get(self.backup_choice).map(|b| b.dir.clone());
         let can_clean =
             !busy && !prechecking && self.detection.is_some() && !self.selected().is_empty();
 
@@ -467,15 +501,18 @@ impl eframe::App for App {
 
                     let restore = theme::button(ui, "还原", Btn::Ghost, !busy && has_backup);
                     if restore.clicked() {
-                        restore_dir = backups.first().cloned();
+                        act_ask_restore = true;
                     }
                     let del = theme::button(ui, "删除备份", Btn::Ghost, !busy && has_backup);
                     if del.clicked() {
-                        delete_dir = backups.first().cloned();
+                        delete_dir = chosen_dir.clone();
                     }
                     if !has_backup && !busy {
                         restore.on_hover_text("没有可用的备份");
                         del.on_hover_text("没有可用的备份");
+                    } else if !busy {
+                        restore.on_hover_text("先选择要还原的备份，确认后再执行");
+                        del.on_hover_text("删除当前选中的那一份备份");
                     }
 
                     if busy {
@@ -816,6 +853,110 @@ impl eframe::App for App {
             }
         }
 
+        // ── 还原前的确认与备份选择 ──
+        // 备份可能不止一份（多次清理、旧版本留下的），还原前要让用户看清自己选的是哪一份。
+        if self.confirm_restore {
+            let mut go = false;
+            let mut cancel = false;
+            let mut picked: Option<usize> = None;
+            let selected_ok = self.chosen_backup().is_some_and(|b| b.manifest_ok);
+
+            let modal = egui::Modal::new(egui::Id::new("confirm_restore"))
+                .frame(theme::dialog_frame())
+                .show(ui.ctx(), |ui| {
+                    ui.set_width(460.0);
+                    dialog_title(ui, "确认还原");
+                    ui.label(
+                        RichText::new("将把所选备份的内容还原回原位置。")
+                            .size(13.0)
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(6.0);
+                    theme::weak(
+                        ui,
+                        "请确认这一份就是你刚才清理时生成的。来源不明的备份不要还原。",
+                    );
+                    ui.add_space(10.0);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("backup_list")
+                        .max_height(190.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            theme::card(ui, |ui| {
+                                for (i, b) in self.backups.iter().enumerate() {
+                                    if i > 0 {
+                                        theme::divider(ui);
+                                    }
+                                    let mut sel = i == self.backup_choice;
+                                    theme::row(ui, 9, |ui| {
+                                        ui.horizontal(|ui| {
+                                            if theme::checkbox(ui, &mut sel, true).clicked() {
+                                                picked = Some(i);
+                                            }
+                                            ui.add_space(11.0);
+                                            ui.vertical(|ui| {
+                                                theme::strong(ui, &fmt_stamp(&b.started_at));
+                                                let detail = if b.manifest_ok {
+                                                    format!(
+                                                        "{} 个动作 · {}",
+                                                        b.actions,
+                                                        b.dir.display()
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "manifest 无法读取 · {}",
+                                                        b.dir.display()
+                                                    )
+                                                };
+                                                theme::weak(ui, &detail);
+                                            });
+                                        });
+                                    });
+                                }
+                            });
+                        });
+
+                    ui.add_space(10.0);
+                    if !selected_ok {
+                        ui.label(
+                            RichText::new("选中的备份无法读取，不能用于还原。")
+                                .size(12.5)
+                                .color(theme::DANGER),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    theme::weak(ui, "还原期间请不要关闭窗口。");
+
+                    dialog_footer(ui, |ui| {
+                        if theme::primary_button(ui, "开始还原").clicked() {
+                            go = true;
+                        }
+                        if theme::ghost_button(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if modal.should_close() {
+                cancel = true;
+            }
+
+            if let Some(i) = picked {
+                self.backup_choice = i;
+            }
+            // 用选中后的最新下标复核一次，避免同一帧里「改选 + 确认」用到旧值
+            let ok_now = self.chosen_backup().is_some_and(|b| b.manifest_ok);
+            if go && ok_now {
+                self.confirm_restore = false;
+                if let Some(dir) = self.chosen_backup().map(|b| b.dir.clone()) {
+                    let ctx = ui.ctx().clone();
+                    self.start_restore(&ctx, dir);
+                }
+            } else if cancel {
+                self.confirm_restore = false;
+            }
+        }
+
         // ── 面板之外执行动作 ──
         if act_scan {
             self.reset();
@@ -827,9 +968,8 @@ impl eframe::App for App {
             let ctx = ui.ctx().clone();
             self.start_precheck(&ctx);
         }
-        if let Some(dir) = restore_dir {
-            let ctx = ui.ctx().clone();
-            self.start_restore(&ctx, dir);
+        if act_ask_restore {
+            self.confirm_restore = true;
         }
         if let Some(dir) = delete_dir {
             self.confirm_delete = Some(dir);

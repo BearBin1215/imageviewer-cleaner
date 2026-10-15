@@ -4,11 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backup::{self, Journal, Quarantine};
+use crate::backup::{self, BackupInfo, Journal, Quarantine};
 use crate::clean::{self, CleanOptions};
 use crate::data::Tables;
 use crate::detect;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::harden;
 use crate::model::{Action, ComponentId, Detection, Manifest};
 use crate::progress::{Progress, Reporter, Stage, Summary};
@@ -28,6 +28,10 @@ pub struct CleanupConfig {
     /// 覆盖隔离区根目录。默认取安装目录所在卷下的 `imageviewer-cleaner\quarantine`。
     /// 测试用它指向临时目录。
     pub quarantine_root: Option<PathBuf>,
+    /// 是否把隔离区目录的权限收紧为「仅管理员可访问」。默认开启，见
+    /// [`backup::Quarantine::prepare`]。测试置 false：收紧之后非提权的测试进程
+    /// 连自己写进去的 manifest 都读不到。
+    pub restrict_quarantine_acl: bool,
 }
 
 impl CleanupConfig {
@@ -36,6 +40,7 @@ impl CleanupConfig {
             selected,
             harden: true,
             quarantine_root: None,
+            restrict_quarantine_acl: true,
         }
     }
 
@@ -46,6 +51,12 @@ impl CleanupConfig {
 
     pub fn with_quarantine_root(mut self, root: PathBuf) -> Self {
         self.quarantine_root = Some(root);
+        self
+    }
+
+    /// 关闭隔离区权限收紧（仅测试使用）
+    pub fn without_acl_restriction(mut self) -> Self {
+        self.restrict_quarantine_acl = false;
         self
     }
 }
@@ -71,7 +82,8 @@ pub fn run_cleanup(
         Some(r) => r.clone(),
         None => backup::default_root(&d.install_dir)?,
     };
-    let q = Quarantine::new(&root, &d.install_dir, &backup::local_timestamp());
+    let q = Quarantine::new(&root, &d.install_dir, &backup::local_timestamp())
+        .with_acl_restriction(cfg.restrict_quarantine_acl);
     let manifest = Manifest {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         started_at: backup::local_timestamp(),
@@ -81,7 +93,7 @@ pub fn run_cleanup(
         target_user_sid: d.target_user_sid.clone(),
         actions: Vec::new(),
     };
-    let mut journal = Journal::start(sys, &q, manifest)?;
+    let mut journal = Journal::start(sys, &q, manifest, rep)?;
     q.mark_hidden(sys); // 目录此时已建立，隐藏属性才能真正生效
     rep.info(format!("隔离区：{}", q.dir.display()));
 
@@ -96,7 +108,7 @@ pub fn run_cleanup(
         Err(e) => {
             rep.warn(format!("清理中断：{e}"));
             rep.warn("正在回滚已完成的改动…");
-            let undone = rollback(sys, journal.actions(), rep);
+            let undone = rollback(sys, tables, &d, &q, journal.actions(), rep);
             rep.warn(format!("回滚完成，共撤销 {undone} 步"));
             discard_quarantine_if_rolled_back(&q, journal.actions(), undone);
             Err(e)
@@ -179,8 +191,19 @@ fn summarize(j: &Journal) -> Summary {
 }
 
 /// 回滚已完成的动作（复用还原层的逆序撤销逻辑，避免两处实现不一致）。
-fn rollback(sys: &SysContext, actions: &[Action], rep: &Reporter) -> usize {
-    let report = restore::undo_actions(sys, actions, rep);
+///
+/// 动作来自本次运行的内存日志，边界同样由探测结果给出：不因为是自己写的就跳过
+/// 校验，两处使用同一套校验，避免回滚比还原更宽松。
+fn rollback(
+    sys: &SysContext,
+    tables: &Tables,
+    d: &Detection,
+    q: &Quarantine,
+    actions: &[Action],
+    rep: &Reporter,
+) -> usize {
+    let scope = restore::RestoreScope::new(tables, &d.target_user_sid, &d.install_dir, q);
+    let report = restore::undo_actions(sys, actions, &scope, rep);
     if actions
         .iter()
         .any(|a| matches!(a, Action::ProcessKilled { .. }))
@@ -201,16 +224,28 @@ fn discard_quarantine_if_rolled_back(q: &Quarantine, actions: &[Action], undone:
     }
 }
 
-/// 从最近一次备份还原
-pub fn run_restore(sys: &SysContext, quarantine_dir: &Path, rep: &Reporter) -> Result<()> {
+/// 从指定备份还原
+///
+/// 安装目录以**探测结果**为准，不用 manifest 自报的值：manifest 是磁盘上的
+/// 输入，可能被替换或篡改。
+pub fn run_restore(
+    sys: &SysContext,
+    tables: &Tables,
+    quarantine_dir: &Path,
+    rep: &Reporter,
+) -> Result<()> {
     rep.stage(Stage::Backup);
-    let q = Quarantine::at(quarantine_dir, PathBuf::new());
-    // install_dir 由 manifest 提供，这里只是为了构造读取入口
+    let q = Quarantine::at(quarantine_dir);
     let m = q.read_manifest()?;
-    let q = Quarantine::at(quarantine_dir, m.install_dir.clone());
+    let Some(install_dir) = resolve_install_dir(sys, tables, &m, rep) else {
+        return Err(Error::InstallNotFound);
+    };
 
     rep.info(format!("从 {} 还原", q.dir.display()));
-    let (_, report) = restore::restore(sys, &q, rep)?;
+    // 目标用户取 manifest 记录值：它只决定关联键候选按哪个用户的展开来匹配，
+    // 导入范围随后仍被限定在数据表声明的百度关联键内（见 RestoreScope::sid）
+    let scope = restore::RestoreScope::new(tables, &m.target_user_sid, &install_dir, &q);
+    let (_, report) = restore::restore(sys, &q, &scope, rep)?;
 
     if !report.registry_failed.is_empty() {
         rep.warn(format!(
@@ -220,6 +255,29 @@ pub fn run_restore(sys: &SysContext, quarantine_dir: &Path, rep: &Reporter) -> R
     }
     rep.success("还原完成");
     Ok(())
+}
+
+/// 还原时使用的安装目录：优先用探测结果；探测不到（客户端已卸载）才退回
+/// manifest 记录的位置，并要求 marker 文件仍在——manifest 单独不足以充当边界。
+fn resolve_install_dir(
+    sys: &SysContext,
+    tables: &Tables,
+    m: &Manifest,
+    rep: &Reporter,
+) -> Option<PathBuf> {
+    if let Ok(d) = detect::locate_install_dir(sys, tables, &m.target_user_sid) {
+        return Some(d);
+    }
+    let fallback = m.install_dir.clone();
+    if fallback.join(&tables.paths.marker).exists() {
+        rep.warn(format!(
+            "未能探测到安装目录，改用备份记录的位置：{}",
+            fallback.display()
+        ));
+        return Some(fallback);
+    }
+    rep.warn("既探测不到安装目录，备份记录的位置也没有 marker 文件，拒绝还原");
+    None
 }
 
 /// 只探测，不做任何改动
@@ -236,18 +294,17 @@ pub fn run_detect(sys: &SysContext, tables: &Tables, rep: &Reporter) -> Result<D
 ///
 /// 界面用它刷新「还原 / 删除备份」可用的列表，无需自行拼装探测与备份逻辑。
 /// 旧版本把备份放在安装目录的同级目录，那里的存量备份也要继续列出。
-pub fn locate_backups(sys: &SysContext, tables: &Tables, sid: &str) -> Result<Vec<PathBuf>> {
+pub fn locate_backups(sys: &SysContext, tables: &Tables, sid: &str) -> Result<Vec<BackupInfo>> {
     let install_dir = detect::locate_install_dir(sys, tables, sid)?;
     let mut list = backup::list_backups(&backup::default_root(&install_dir)?);
     if let Some(old) = backup::legacy_root(&install_dir) {
-        for p in backup::list_backups(&old) {
-            if !list.contains(&p) {
-                list.push(p);
+        for info in backup::list_backups(&old) {
+            if !list.iter().any(|b| b.dir == info.dir) {
+                list.push(info);
             }
         }
-        list.sort();
-        list.reverse();
     }
+    list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     Ok(list)
 }
 
@@ -365,7 +422,8 @@ mod tests {
         // 显式启用加固，以便覆盖占位物的建立与还原；全选，覆盖所有组件
         let cfg = CleanupConfig::new(ComponentId::ALL.to_vec())
             .with_harden(true)
-            .with_quarantine_root(qroot.clone());
+            .with_quarantine_root(qroot.clone())
+            .without_acl_restriction();
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
         // 全部组件都被清理：看图目录内容 2 项 + 启动器 + 旧版引擎 + D3D 运行库
@@ -427,7 +485,7 @@ mod tests {
             .find(|p| p.is_dir())
             .expect("应存在隔离区目录");
 
-        run_restore(&sys, &qdir, &Reporter::silent()).unwrap();
+        run_restore(&sys, &tables, &qdir, &Reporter::silent()).unwrap();
 
         // 组件回到原位
         assert!(
@@ -472,8 +530,9 @@ mod tests {
         // 预先删掉一个必需文件，模拟非基线版本的安装现场
         std::fs::remove_file(dir.join(r"module\BrowserEngine\vastplayer.dll")).unwrap();
 
-        let cfg =
-            CleanupConfig::new(vec![ComponentId::ImageViewer]).with_quarantine_root(qroot.clone());
+        let cfg = CleanupConfig::new(vec![ComponentId::ImageViewer])
+            .with_quarantine_root(qroot.clone())
+            .without_acl_restriction();
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
         assert_eq!(summary.files_moved, 2, "看图目录内容应照常被清理");
@@ -502,7 +561,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.join(r"module\BrowserEngine"));
         std::fs::write(dir.join(r"module\BrowserEngine"), b"x").unwrap();
 
-        let cfg = CleanupConfig::new(vec![ComponentId::Player]).with_quarantine_root(qroot.clone());
+        let cfg = CleanupConfig::new(vec![ComponentId::Player])
+            .with_quarantine_root(qroot.clone())
+            .without_acl_restriction();
 
         let err = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap_err();
         assert!(
@@ -530,7 +591,8 @@ mod tests {
         // 只勾播放器：看图与文件关联都不勾
         let cfg = CleanupConfig::new(vec![ComponentId::Player])
             .with_harden(true)
-            .with_quarantine_root(qroot.clone());
+            .with_quarantine_root(qroot.clone())
+            .without_acl_restriction();
 
         let summary = run_cleanup(&sys, &tables, &cfg, &Reporter::silent()).unwrap();
         // 播放器一项就覆盖五个固定目标加两个通配命中的更新备份

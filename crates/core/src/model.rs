@@ -55,7 +55,7 @@ macro_rules! define_component_id {
             /// 全部组件。进入枚举就会出现在界面的可勾选清单里；
             /// 默认勾选状态由 [`Self::default_enabled`] 决定。
             ///
-            /// 本清单与枚举由 [`define_component_id!`] 从同一份变体列表生成，
+            /// 本清单与枚举由 `define_component_id!` 从同一份变体列表生成，
             /// 不需要也无法单独登记。
             pub const ALL: [Self; define_component_id!(@count $($variant)*)] =
                 [$(Self::$variant),*];
@@ -185,6 +185,55 @@ impl ComponentId {
             Self::ImageViewer | Self::Player | Self::RegistryAssoc => true,
         }
     }
+
+    /// 相对安装目录的路径是否可能是本组件声明过的清理目标。
+    ///
+    /// 覆盖以下情况：固定目标、通配前缀展开出的条目、以及「清空目录内容」型组件
+    /// 目录下的直接子项。还原时用它复核 manifest 自报的目标，因此**不能依赖
+    /// 磁盘当前状态**——通配目标此时已经被搬走了，磁盘上什么也查不到。
+    ///
+    /// 通配前缀按 [`crate::detect::component_rels`] 的 `starts_with` 同一规则
+    /// 匹配，**包括恰好等于前缀的名字**：那个名字能被搬走，就必须能被匹配到。
+    pub fn matches_target(self, relative: &str) -> bool {
+        for p in self.relative_paths() {
+            if p.eq_ignore_ascii_case(relative) {
+                return true;
+            }
+            if self.moves_dir_contents() && is_direct_child_of(p, relative) {
+                return true;
+            }
+        }
+        self.prefix_targets().iter().any(|pt| {
+            let head = format!("{}\\{}", pt.dir, pt.prefix);
+            relative
+                .get(..head.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(&head))
+        })
+    }
+}
+
+/// `relative` 是否是 `dir` 的直接子项（只比一层，不递归到孙辈）
+fn is_direct_child_of(dir: &str, relative: &str) -> bool {
+    let Some(head) = relative.get(..dir.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(dir) {
+        return false;
+    }
+    if relative.as_bytes().get(dir.len()) != Some(&b'\\') {
+        return false;
+    }
+    match relative.get(dir.len() + 1..) {
+        Some(rest) => !rest.is_empty() && !rest.contains('\\'),
+        None => false,
+    }
+}
+
+/// 该相对路径是否是任一组件声明过的清理目标
+pub fn is_declared_target(relative: &str) -> bool {
+    ComponentId::ALL
+        .iter()
+        .any(|id| id.matches_target(relative))
 }
 
 /// 探测结果
@@ -281,6 +330,28 @@ impl RegPath {
 
     pub fn machine_classes() -> Self {
         Self::hklm(r"Software\Classes")
+    }
+
+    /// `self` 是否等于 `ancestor`，或位于其子树内（必须同一个根）。
+    ///
+    /// 用于把「备份文件里写了什么」限制在「这次允许还原的范围」之内：
+    /// `.reg` 来自磁盘，可能被替换或篡改，只看键路径本身，不看来历。
+    pub fn is_within(&self, ancestor: &RegPath) -> bool {
+        if self.root != ancestor.root {
+            return false;
+        }
+        // 空 sub 表示根键本身，任何同根的键都在其内
+        if ancestor.sub.is_empty() || self.sub.eq_ignore_ascii_case(&ancestor.sub) {
+            return true;
+        }
+        // 逐字符比较前缀，并确认边界是分隔符（`A` 不得匹配 `AB`）
+        match self.sub.get(..ancestor.sub.len()) {
+            Some(head) => {
+                head.eq_ignore_ascii_case(&ancestor.sub)
+                    && self.sub.as_bytes().get(ancestor.sub.len()) == Some(&b'\\')
+            }
+            None => false,
+        }
     }
 }
 
@@ -460,5 +531,43 @@ mod tests {
         assert!(!c.present());
         let c = Component { found: 3, ..c };
         assert!(c.present());
+    }
+
+    /// [`ComponentId::matches_target`] 与 [`crate::detect::component_rels`]
+    /// 的展开规则必须一致：清理层搬走的每一项，还原时都要能被匹配到。
+    ///
+    /// 关键样本是恰好等于通配前缀的文件名——它会被 `starts_with` 命中并搬走，
+    /// `matches_target` 若不接受相等，这份备份就永远无法还原。
+    #[test]
+    fn matches_target_recognizes_everything_component_rels_moves() {
+        use crate::detect;
+
+        let dir = std::env::temp_dir().join("bc_model_matches");
+        let _ = std::fs::remove_dir_all(&dir);
+        let be = dir.join(r"module\BrowserEngine");
+        std::fs::create_dir_all(&be).unwrap();
+        // 恰好等于前缀的名字，以及带时间戳的常规形态
+        std::fs::write(be.join("vastplayer.dll.old"), b"x").unwrap();
+        std::fs::write(be.join("vastplayer.dll.old20260608T084445"), b"x").unwrap();
+
+        for rel in detect::component_rels(&dir, ComponentId::Player) {
+            assert!(
+                ComponentId::Player.matches_target(&rel),
+                "component_rels 展开的 {rel} 必须能被 matches_target 匹配到"
+            );
+        }
+        assert!(
+            ComponentId::Player.matches_target(r"module\BrowserEngine\vastplayer.dll.old"),
+            "恰好等于前缀的名字必须被匹配到"
+        );
+
+        // 非目标一律不匹配：同目录的其他文件与跨组件的路径
+        assert!(!ComponentId::Player.matches_target(r"module\BrowserEngine\videoipc.dll"));
+        assert!(!ComponentId::ImageViewer.matches_target(r"module\BrowserEngine\vastplayer.dll"));
+        // 「清空目录内容」型组件：直接子项可匹配，更深层的不匹配（清理也只搬直接子项）
+        assert!(ComponentId::ImageViewer.matches_target(r"module\ImageViewer\Qt5Core.dll"));
+        assert!(!ComponentId::ImageViewer.matches_target(r"module\ImageViewer\sub\x.dll"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
